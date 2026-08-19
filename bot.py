@@ -17,766 +17,541 @@ from aiogram.types import (
     Message,
 )
 
-# ============================================================
-# НАСТРОЙКИ
-# ============================================================
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
 
+# Получаем токены из переменных окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID")
+ADMINS_ENV = os.getenv("ADMIN_ID", "")
 
-if not BOT_TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN в переменных окружения!")
+# Превращаем строку с админами в список чисел
+ADMIN_IDS = []
+for admin_str in ADMINS_ENV.split(","):
+    admin_str = admin_str.strip()
+    if admin_str.isdigit():
+        ADMIN_IDS.append(int(admin_str))
 
-if not ADMIN_ID:
-    raise RuntimeError("Не задан ADMIN_ID в переменных окружения!")
-
-ADMIN_ID = int(ADMIN_ID)
+if not BOT_TOKEN or not ADMIN_IDS:
+    logging.error("Не заданы BOT_TOKEN или ADMIN_ID в переменных окружения!")
 
 DB_FILE = "feedback.db"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(
-        parse_mode=ParseMode.HTML
-    )
-)
-
+# Инициализация бота и диспетчера
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 
-# ============================================================
+# ==========================================
 # БАЗА ДАННЫХ
-# ============================================================
-
-def get_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
+# ==========================================
 def init_db():
-    conn = get_db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS appeals (
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tickets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            category TEXT NOT NULL,
-            text TEXT NOT NULL,
-            photo_file_id TEXT,
-            status TEXT NOT NULL DEFAULT 'new',
-            created_at TEXT NOT NULL,
-            admin_answer TEXT
+            user_id INTEGER,
+            category TEXT,
+            text TEXT,
+            status TEXT DEFAULT 'Новое 📥',
+            created_at TEXT
         )
     """)
     conn.commit()
     conn.close()
 
 
-def create_appeal(user_id, category, text, photo_file_id=None):
-    conn = get_db()
-    cursor = conn.execute(
-        """
-        INSERT INTO appeals
-        (user_id, category, text, photo_file_id, status, created_at)
-        VALUES (?, ?, ?, ?, 'new', ?)
-        """,
-        (
-            user_id,
-            category,
-            text,
-            photo_file_id,
-            datetime.now().strftime("%d.%m.%Y %H:%M"),
-        )
-    )
-    appeal_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return appeal_id
+# ==========================================
+# МАШИНА СОСТОЯНИЙ (FSM)
+# ==========================================
+class FeedbackState(StatesGroup):
+    choosing_category = State()
+    waiting_for_text = State()
+    replying_to_user = State()
 
 
-def get_appeal(appeal_id):
-    conn = get_db()
-    result = conn.execute(
-        "SELECT * FROM appeals WHERE id = ?",
-        (appeal_id,)
-    ).fetchone()
-    conn.close()
-    return result
-
-
-def get_appeals_by_status(status):
-    conn = get_db()
-    result = conn.execute(
-        "SELECT * FROM appeals WHERE status = ? ORDER BY id DESC",
-        (status,)
-    ).fetchall()
-    conn.close()
-    return result
-
-
-def get_all_appeals():
-    conn = get_db()
-    result = conn.execute(
-        "SELECT * FROM appeals ORDER BY id DESC"
-    ).fetchall()
-    conn.close()
-    return result
-
-
-def update_status(appeal_id, status):
-    conn = get_db()
-    conn.execute(
-        "UPDATE appeals SET status = ? WHERE id = ?",
-        (status, appeal_id)
-    )
-    conn.commit()
-    conn.close()
-
-
-def save_admin_answer(appeal_id, answer):
-    conn = get_db()
-    conn.execute(
-        """
-        UPDATE appeals
-        SET admin_answer = ?, status = 'in_work'
-        WHERE id = ?
-        """,
-        (answer, appeal_id)
-    )
-    conn.commit()
-    conn.close()
-
-
-# ============================================================
-# КАТЕГОРИИ
-# ============================================================
-
-CATEGORIES = {
-    "complaint": "😕 Жалоба",
-    "improvement": "💡 Улучшение работы",
-    "question": "❓ Вопрос",
-    "thanks": "🙏 Благодарность",
-    "problem": "🏪 Проблема на рабочем месте",
-    "schedule": "📅 График и организация работы",
-    "salary": "💰 Зарплата и выплаты",
-    "other": "🔹 Другое",
-}
-
-
-# ============================================================
+# ==========================================
 # КЛАВИАТУРЫ
-# ============================================================
-
+# ==========================================
 def main_menu():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Новое обращение", callback_data="new_appeal")],
-            [InlineKeyboardButton(text="ℹ️ Как это работает", callback_data="about")],
+            [
+                InlineKeyboardButton(
+                    text="📋 Новое обращение", callback_data="new_ticket"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📂 Мои обращения", callback_data="my_tickets"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💡 Частые вопросы (FAQ)", callback_data="faq_menu"
+                )
+            ],
         ]
     )
 
 
-def categories_keyboard():
-    buttons = []
-    for key, name in CATEGORIES.items():
-        buttons.append([InlineKeyboardButton(text=name, callback_data=f"category:{key}")])
-    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-def cancel_keyboard():
+def categories_menu():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+            [
+                InlineKeyboardButton(
+                    text="💰 Зарплата и выплаты", callback_data="cat_Зарплата"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👥 График и условия труда", callback_data="cat_Условия"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💡 Идеи и улучшение процессов",
+                    callback_data="cat_Идеи",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⚠️ Жалоба / Конфликт", callback_data="cat_Жалоба"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💬 Другое", callback_data="cat_Другое"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад в меню", callback_data="back_main"
+                )
+            ],
         ]
     )
 
 
-def photo_choice_keyboard():
+def faq_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📷 Добавить фото", callback_data="add_photo")],
-            [InlineKeyboardButton(text="➡️ Продолжить без фото", callback_data="without_photo")],
-            [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+            [
+                InlineKeyboardButton(
+                    text="❓ Как рассчитываются премии?", callback_data="faq_1"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❓ Куда обращаться по форме?", callback_data="faq_2"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад в меню", callback_data="back_main"
+                )
+            ],
         ]
     )
 
 
-def confirmation_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✅ ПОДТВЕРДИТЬ ОТПРАВКУ", callback_data="confirm_send")],
-            [InlineKeyboardButton(text="✏️ Изменить", callback_data="edit_appeal")],
-            [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
-        ]
-    )
-
-
-def admin_panel_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📥 Новые", callback_data="admin_list:new")],
-            [InlineKeyboardButton(text="🟡 В работе", callback_data="admin_list:in_work")],
-            [InlineKeyboardButton(text="✅ Закрытые", callback_data="admin_list:closed")],
-            [InlineKeyboardButton(text="📚 Все обращения", callback_data="admin_list:all")],
-        ]
-    )
-
-
-def admin_appeal_keyboard(appeal_id, status):
-    buttons = []
-    if status == "new":
-        buttons.append([InlineKeyboardButton(text="🟡 Взять в работу", callback_data=f"admin_work:{appeal_id}")])
-
-    if status != "closed":
-        buttons.append([InlineKeyboardButton(text="💬 Ответить", callback_data=f"admin_reply:{appeal_id}")])
-        buttons.append([InlineKeyboardButton(text="✅ Закрыть", callback_data=f"admin_close:{appeal_id}")])
-
-    buttons.append([InlineKeyboardButton(text="⬅️ К списку", callback_data="admin_back_list")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-def admin_list_keyboard(appeals):
-    buttons = []
-    for appeal in appeals:
-        status_icon = {"new": "📥", "in_work": "🟡", "closed": "✅"}.get(appeal["status"], "📌")
-        button_text = f"{status_icon} #{appeal['id']} • {appeal['created_at']} • {appeal['category']}"
-        buttons.append([InlineKeyboardButton(text=button_text, callback_data=f"admin_view:{appeal['id']}")])
-    buttons.append([InlineKeyboardButton(text="⬅️ Панель руководителя", callback_data="admin_panel")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-# ============================================================
-# СОСТОЯНИЯ
-# ============================================================
-
-class AppealState(StatesGroup):
-    waiting_text = State()
-    waiting_photo = State()
-    waiting_photo_upload = State()
-    confirmation = State()
-
-
-class AdminReplyState(StatesGroup):
-    waiting_answer = State()
-
-
-# ============================================================
-# START
-# ============================================================
-
+# ==========================================
+# ОБРАБОТЧИКИ КОМАНД И КНОПОК
+# ==========================================
 @dp.message(Command("start"))
-async def start_handler(message: Message, state: FSMContext):
-    await state.clear()
-    if message.from_user.id == ADMIN_ID:
-        await message.answer(
-            "👨‍💼 <b>Панель руководителя</b>\n\nВыберите раздел:",
-            reply_markup=admin_panel_keyboard()
-        )
-    else:
-        await message.answer(
-            "👋 <b>Анонимная обратная связь</b>\n\n"
-            "Здесь вы можете оставить обращение руководителю анонимно.\n\n"
-            "🔒 Ваше имя и username руководителю не показываются.\n\n"
-            "Выберите действие:",
-            reply_markup=main_menu()
-        )
-
-
-# ============================================================
-# НОВОЕ ОБРАЩЕНИЕ
-# ============================================================
-
-@dp.callback_query(F.data == "new_appeal")
-async def new_appeal(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text(
-        "📋 <b>Выберите категорию обращения:</b>",
-        reply_markup=categories_keyboard()
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("category:"))
-async def category_handler(callback: CallbackQuery, state: FSMContext):
-    category_key = callback.data.split(":", 1)[1]
-    category = CATEGORIES.get(category_key, "🔹 Другое")
-
-    await state.update_data(category=category)
-    await state.set_state(AppealState.waiting_text)
-
-    await callback.message.edit_text(
-        f"<b>{category}</b>\n\n"
-        "📝 Напишите текст обращения.\n\n"
-        "После этого я покажу вам готовое обращение перед отправкой.\n\n"
-        "🔒 Руководителю оно будет отправлено только после вашего подтверждения.",
-        reply_markup=cancel_keyboard()
-    )
-    await callback.answer()
-
-
-@dp.message(AppealState.waiting_text, F.text)
-async def receive_text(message: Message, state: FSMContext):
-    text = message.text.strip()
-    if not text:
-        await message.answer("⚠️ Напишите текст обращения.")
-        return
-
-    await state.update_data(text=text)
-    await state.set_state(AppealState.waiting_photo)
-
-    await message.answer(
-        "📷 Хотите добавить фотографию?\n\nФотография не обязательна.",
-        reply_markup=photo_choice_keyboard()
-    )
-
-
-@dp.callback_query(AppealState.waiting_photo, F.data == "add_photo")
-async def add_photo(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text(
-        "📷 <b>Отправьте фотографию.</b>\n\n"
-        "После фотографии появится предварительный просмотр обращения."
-    )
-    await state.set_state(AppealState.waiting_photo_upload)
-    await callback.answer()
-
-
-@dp.callback_query(AppealState.waiting_photo, F.data == "without_photo")
-async def without_photo(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(photo=None)
-    await show_preview(callback.message, state)
-    await callback.answer()
-
-
-@dp.message(AppealState.waiting_photo_upload, F.photo)
-async def receive_photo(message: Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id
-    await state.update_data(photo=photo_id)
-    await show_preview(message, state)
-
-
-async def show_preview(target_message, state: FSMContext):
-    data = await state.get_data()
-    category = data.get("category", "🔹 Другое")
-    text = data.get("text", "")
-    photo = data.get("photo")
-
-    preview = (
-        "📋 <b>ПРЕДПРОСМОТР ОБРАЩЕНИЯ</b>\n\n"
-        f"📂 <b>Категория:</b>\n{category}\n\n"
-        f"📝 <b>Текст:</b>\n{text}\n\n"
-    )
-
-    if photo:
-        preview += "📷 <b>Фотография:</b> прикреплена\n\n"
-    else:
-        preview += "📷 <b>Фотография:</b> нет\n\n"
-
-    preview += (
-        "⚠️ <b>Обратите внимание:</b>\n"
-        "После нажатия «Подтвердить отправку» обращение будет передано руководителю."
-    )
-
-    await state.set_state(AppealState.confirmation)
-
-    if photo:
-        await target_message.answer_photo(
-            photo=photo,
-            caption=preview,
-            reply_markup=confirmation_keyboard()
-        )
-    else:
-        await target_message.answer(
-            preview,
-            reply_markup=confirmation_keyboard()
-        )
-
-
-@dp.callback_query(AppealState.confirmation, F.data == "confirm_send")
-async def confirm_send(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    category = data.get("category")
-    text = data.get("text")
-    photo = data.get("photo")
-
-    if not category or not text:
-        await callback.answer("Обращение заполнено не полностью.", show_alert=True)
-        return
-
-    appeal_id = create_appeal(
-        user_id=callback.from_user.id,
-        category=category,
-        text=text,
-        photo_file_id=photo
-    )
-
-    appeal = get_appeal(appeal_id)
-    await send_to_admin(appeal)
-    await state.clear()
-
-    await callback.message.answer(
-        f"✅ <b>Обращение #{appeal_id} отправлено.</b>\n\n"
-        "Руководитель получил его анонимно.\n\n"
-        "Если руководитель ответит, ответ придёт сюда.",
-        reply_markup=main_menu()
-    )
-    await callback.answer("Обращение отправлено!")
-
-
-@dp.callback_query(AppealState.confirmation, F.data == "edit_appeal")
-async def edit_appeal(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    category = data.get("category", "🔹 Другое")
-
-    await state.set_state(AppealState.waiting_text)
-    await callback.message.answer(
-        f"✏️ <b>Редактирование</b>\n\nКатегория: {category}\n\nНапишите новый текст обращения.",
-        reply_markup=cancel_keyboard()
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "cancel")
-async def cancel_handler(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text(
-        "❌ Обращение отменено.\n\nНичего руководителю не отправлено.",
-        reply_markup=main_menu()
-    )
-    await callback.answer()
-
-
-@dp.message(Command("cancel"))
-async def cancel_command(message: Message, state: FSMContext):
+async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "❌ Обращение отменено.\n\nНичего руководителю не отправлено.",
-        reply_markup=main_menu()
+        "💚 <b>Добро пожаловать в официальный сервис обратной связи ВкусВилл!</b>\n\n"
+        "Здесь вы можете безопасно и анонимно поделиться своей идеей, задать вопрос или сообщить о проблеме. Ваше мнение помогает нам становиться лучше каждый день!\n\n"
+        "Выберите действие ниже:",
+        reply_markup=main_menu(),
     )
 
 
-# ============================================================
-# ОТПРАВКА РУКОВОДИТЕЛЮ
-# ============================================================
+# --- СТАТИСТИКА ДЛЯ АДМИНОВ (/stats) ---
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
 
-async def send_to_admin(appeal):
-    status_text = "📥 Новое"
-    message_text = (
-        "📩 <b>НОВОЕ АНОНИМНОЕ ОБРАЩЕНИЕ</b>\n\n"
-        f"🔢 <b>Номер:</b> #{appeal['id']}\n"
-        f"📅 <b>Дата:</b> {appeal['created_at']}\n"
-        f"📂 <b>Категория:</b> {appeal['category']}\n"
-        f"📌 <b>Статус:</b> {status_text}\n\n"
-        f"📝 <b>Текст:</b>\n{appeal['text']}\n\n"
-        "🔒 Данные сотрудника скрыты."
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    # Всего обращений
+    cursor.execute("SELECT COUNT(*) FROM tickets")
+    total = cursor.fetchone()[0]
+
+    # Новые
+    cursor.execute("SELECT COUNT(*) FROM tickets WHERE status LIKE '%Новое%'")
+    new_count = cursor.fetchone()[0]
+
+    # Решенные
+    cursor.execute("SELECT COUNT(*) FROM tickets WHERE status LIKE '%Решено%'")
+    resolved_count = cursor.fetchone()[0]
+
+    # По категориям
+    cursor.execute(
+        "SELECT category, COUNT(*) FROM tickets GROUP BY category"
+    )
+    categories = cursor.fetchall()
+
+    conn.close()
+
+    stats_text = (
+        f"📊 <b>Статистика сервиса обратной связи ВкусВилл</b>\n\n"
+        f"📌 Всего обращений: <b>{total}</b>\n"
+        f"📥 Новых (ожидают): <b>{new_count}</b>\n"
+        f"✅ Решенных: <b>{resolved_count}</b>\n\n"
+        f"📂 <b>По категориям:</b>\n"
     )
 
-    keyboard = admin_appeal_keyboard(appeal["id"], appeal["status"])
+    for cat, count in categories:
+        stats_text += f"• {cat}: <b>{count}</b>\n"
 
-    if appeal["photo_file_id"]:
-        await bot.send_photo(
-            ADMIN_ID,
-            photo=appeal["photo_file_id"],
-            caption=message_text,
-            reply_markup=keyboard
-        )
-    else:
-        await bot.send_message(
-            ADMIN_ID,
-            message_text,
-            reply_markup=keyboard
-        )
-
-
-# ============================================================
-# ПАНЕЛЬ РУКОВОДИТЕЛЯ
-# ============================================================
-
-@dp.message(Command("admin"))
-async def admin_command(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ Доступ запрещён.")
-        return
-
-    await message.answer(
-        "👨‍💼 <b>ПАНЕЛЬ РУКОВОДИТЕЛЯ</b>\n\nВыберите раздел:",
-        reply_markup=admin_panel_keyboard()
-    )
-
-
-@dp.callback_query(F.data == "admin_panel")
-async def admin_panel(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
-        return
-
-    await callback.message.edit_text(
-        "👨‍💼 <b>ПАНЕЛЬ РУКОВОДИТЕЛЯ</b>\n\nВыберите раздел:",
-        reply_markup=admin_panel_keyboard()
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("admin_list:"))
-async def admin_list(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
-        return
-
-    mode = callback.data.split(":", 1)[1]
-
-    if mode == "new":
-        appeals = get_appeals_by_status("new")
-        title = "📥 НОВЫЕ ОБРАЩЕНИЯ"
-    elif mode == "in_work":
-        appeals = get_appeals_by_status("in_work")
-        title = "🟡 ОБРАЩЕНИЯ В РАБОТЕ"
-    elif mode == "closed":
-        appeals = get_appeals_by_status("closed")
-        title = "✅ ЗАКРЫТЫЕ ОБРАЩЕНИЯ"
-    else:
-        appeals = get_all_appeals()
-        title = "📚 ВСЕ ОБРАЩЕНИЯ"
-
-    if not appeals:
-        await callback.message.edit_text(
-            f"<b>{title}</b>\n\nЗдесь пока нет обращений.",
-            reply_markup=admin_panel_keyboard()
-        )
-        await callback.answer()
-        return
-
-    await callback.message.edit_text(
-        f"<b>{title}</b>\n\nВыберите обращение:",
-        reply_markup=admin_list_keyboard(appeals)
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("admin_view:"))
-async def admin_view(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
-        return
-
-    appeal_id = int(callback.data.split(":")[1])
-    appeal = get_appeal(appeal_id)
-
-    if not appeal:
-        await callback.answer("Обращение не найдено.", show_alert=True)
-        return
-
-    status_names = {
-        "new": "📥 Новое",
-        "in_work": "🟡 В работе",
-        "closed": "✅ Закрыто"
-    }
-
-    text = (
-        f"📩 <b>ОБРАЩЕНИЕ #{appeal['id']}</b>\n\n"
-        f"📅 <b>Дата:</b> {appeal['created_at']}\n"
-        f"📂 <b>Категория:</b> {appeal['category']}\n"
-        f"📌 <b>Статус:</b> {status_names.get(appeal['status'])}\n\n"
-        f"📝 <b>Текст:</b>\n{appeal['text']}\n\n"
-        "🔒 Сотрудник анонимен."
-    )
-
-    if appeal["admin_answer"]:
-        text += f"\n\n💬 <b>Последний ответ:</b>\n{appeal['admin_answer']}"
-
-    if appeal["photo_file_id"]:
-        await callback.message.answer_photo(
-            photo=appeal["photo_file_id"],
-            caption=text,
-            reply_markup=admin_appeal_keyboard(appeal_id, appeal["status"])
-        )
-    else:
-        await callback.message.edit_text(
-            text,
-            reply_markup=admin_appeal_keyboard(appeal_id, appeal["status"])
-        )
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("admin_work:"))
-async def admin_work(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
-        return
-
-    appeal_id = int(callback.data.split(":")[1])
-    appeal = get_appeal(appeal_id)
-
-    if not appeal:
-        await callback.answer("Обращение не найдено.", show_alert=True)
-        return
-
-    update_status(appeal_id, "in_work")
-    await callback.answer("Обращение взято в работу.")
-    await callback.message.edit_reply_markup(
-        reply_markup=admin_appeal_keyboard(appeal_id, "in_work")
-    )
-
-
-@dp.callback_query(F.data.startswith("admin_reply:"))
-async def admin_reply(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
-        return
-
-    appeal_id = int(callback.data.split(":")[1])
-    appeal = get_appeal(appeal_id)
-
-    if not appeal:
-        await callback.answer("Обращение не найдено.", show_alert=True)
-        return
-
-    await state.set_state(AdminReplyState.waiting_answer)
-    await state.update_data(appeal_id=appeal_id)
-
-    await callback.message.answer(
-        f"💬 <b>Ответ на обращение #{appeal_id}</b>\n\n"
-        "Напишите ответ сотруднику.\n\n"
-        "Ответ будет отправлен через бота анонимно.\n\n"
-        "Для отмены используйте /cancel"
-    )
-    await callback.answer()
-
-
-@dp.message(AdminReplyState.waiting_answer, F.text)
-async def receive_admin_answer(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    data = await state.get_data()
-    appeal_id = data.get("appeal_id")
-    appeal = get_appeal(appeal_id)
-
-    if not appeal:
-        await message.answer("❌ Обращение не найдено.")
-        await state.clear()
-        return
-
-    answer = message.text.strip()
-    if not answer:
-        await message.answer("⚠️ Ответ не может быть пустым.")
-        return
-
-    save_admin_answer(appeal_id, answer)
-
-    try:
-        await bot.send_message(
-            appeal["user_id"],
-            f"💬 <b>Ответ руководителя</b>\n\n"
-            f"По обращению #{appeal_id}:\n\n"
-            f"{answer}"
-        )
-        await message.answer(f"✅ Ответ по обращению #{appeal_id} отправлен сотруднику.")
-    except Exception:
-        logging.exception("Ошибка отправки ответа")
-        await message.answer("⚠️ Не удалось отправить ответ сотруднику.")
-
-    await state.clear()
-
-
-@dp.callback_query(F.data.startswith("admin_close:"))
-async def admin_close(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
-        return
-
-    appeal_id = int(callback.data.split(":")[1])
-    appeal = get_appeal(appeal_id)
-
-    if not appeal:
-        await callback.answer("Обращение не найдено.", show_alert=True)
-        return
-
-    update_status(appeal_id, "closed")
-
-    try:
-        await bot.send_message(
-            appeal["user_id"],
-            f"✅ <b>Обращение #{appeal_id} закрыто.</b>\n\nСпасибо за обратную связь."
-        )
-    except Exception:
-        logging.exception("Не удалось уведомить сотрудника")
-
-    await callback.answer("Обращение закрыто.")
-    await callback.message.edit_reply_markup(
-        reply_markup=admin_appeal_keyboard(appeal_id, "closed")
-    )
-
-
-@dp.callback_query(F.data == "admin_back_list")
-async def admin_back_list(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
-        return
-
-    appeals = get_all_appeals()
-    if not appeals:
-        await callback.message.edit_text(
-            "📚 <b>Все обращения</b>\n\nОбращений пока нет.",
-            reply_markup=admin_panel_keyboard()
-        )
-        await callback.answer()
-        return
-
-    await callback.message.edit_text(
-        "📚 <b>Все обращения</b>\n\nВыберите обращение:",
-        reply_markup=admin_list_keyboard(appeals)
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "about")
-async def about(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "ℹ️ <b>Как работает бот</b>\n\n"
-        "1️⃣ Вы выбираете категорию.\n\n"
-        "2️⃣ Пишете обращение.\n\n"
-        "3️⃣ При желании добавляете фото.\n\n"
-        "4️⃣ Бот показывает предварительный просмотр.\n\n"
-        "5️⃣ Вы нажимаете «Подтвердить отправку».\n\n"
-        "6️⃣ Только после подтверждения обращение поступает руководителю.\n\n"
-        "🔒 Ваше имя и username руководителю не показываются.",
-        reply_markup=main_menu()
-    )
-    await callback.answer()
+    await message.answer(stats_text)
 
 
 @dp.callback_query(F.data == "back_main")
-async def back_main(callback: CallbackQuery, state: FSMContext):
+async def back_to_main(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text(
-        "📋 <b>Главное меню</b>\n\nВыберите действие:",
-        reply_markup=main_menu()
+        "💚 <b>Главное меню ВкусВилл:</b>\nВыберите действие:",
+        reply_markup=main_menu(),
     )
     await callback.answer()
 
 
-@dp.message(StateFilter(None))
-async def fallback(message: Message):
-    if message.from_user.id == ADMIN_ID:
-        await message.answer("Используйте /admin для панели руководителя.")
+# --- FAQ ---
+@dp.callback_query(F.data == "faq_menu")
+async def show_faq(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "💡 <b>Частые вопросы (FAQ):</b>\nВыберите интересующую тему:",
+        reply_markup=faq_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.in_({"faq_1", "faq_2"}))
+async def show_faq_answer(callback: CallbackQuery):
+    if callback.data == "faq_1":
+        text = (
+            "💰 <b>Как рассчитываются премии?</b>\n\n"
+            "Премиальная часть зависит от выполнения показателей конкретной торговой точки / отдела, "
+            "соблюдения стандартов качества и личного вклада."
+        )
+    else:
+        text = (
+            "👕 <b>Куда обращаться по поводу формы?</b>\n\n"
+            "По вопросам выдачи и замены одежды обратитесь к вашему управляющему или напишите через раздел «📋 Новое обращение»."
+        )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⬅️ К списку вопросов", callback_data="faq_menu"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🏠 В главное меню", callback_data="back_main"
+                )
+            ],
+        ]
+    )
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+
+# --- СОЗДАНИЕ ОБРАЩЕНИЯ ---
+@dp.callback_query(F.data == "new_ticket")
+async def new_ticket_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(FeedbackState.choosing_category)
+    await callback.message.edit_text(
+        "📋 <b>Создание обращения</b>\n\nВыберите категорию вашего вопроса:",
+        reply_markup=categories_menu(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(
+    StateFilter(FeedbackState.choosing_category), F.data.startswith("cat_")
+)
+async def process_category(callback: CallbackQuery, state: FSMContext):
+    category = callback.data.split("_")[1]
+    await state.update_data(category=category)
+    await state.set_state(FeedbackState.waiting_for_text)
+
+    cancel_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="❌ Отменить", callback_data="back_main"
+                )
+            ]
+        ]
+    )
+    await callback.message.edit_text(
+        f"📂 Категория: <b>{category}</b>\n\n"
+        "✍️ Напишите текст вашего обращения одним сообщением:",
+        reply_markup=cancel_kb,
+    )
+    await callback.answer()
+
+
+@dp.message(StateFilter(FeedbackState.waiting_for_text))
+async def process_text(message: Message, state: FSMContext):
+    data = await state.get_data()
+    category = data.get("category")
+    text = message.text
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO tickets (user_id, category, text, created_at) VALUES (?, ?, ?, ?)",
+        (message.from_user.id, category, text, created_at),
+    )
+    ticket_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+
+    await message.answer(
+        f"✅ <b>Ваше обращение успешно отправлено!</b>\n\n"
+        f"🆔 Номер тикета: <code>#{ticket_id}</code>\n"
+        f"📂 Категория: {category}\n"
+        f"Статус: На рассмотрении 📥\n\n"
+        f"Вы можете отслеживать статус в разделе «📂 Мои обращения».",
+        reply_markup=main_menu(),
+    )
+
+    # Рассылаем уведомление ВСЕМ администраторам с уникальным ID сообщения (сохраняем в память/базу если нужно, либо шлем индивидуально)
+    admin_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="💬 Ответить",
+                    callback_data=f"reply_{ticket_id}_{message.from_user.id}",
+                )
+            ]
+        ]
+    )
+
+    # Словарь или таблица для хранения message_id сообщений админам (чтобы потом их редактировать)
+    # Сделаем проще: пришлем каждому админу уведомление
+    for admin_id in ADMIN_IDS:
+        try:
+            sent_msg = await bot.send_message(
+                admin_id,
+                f"🚨 <b>Новое анонимное обращение #{ticket_id}</b>\n\n"
+                f"📂 <b>Категория:</b> {category}\n"
+                f"📅 <b>Дата:</b> {created_at}\n\n"
+                f"💬 <b>Текст:</b>\n{text}",
+                reply_markup=admin_kb,
+            )
+            # Сохраняем ID сообщения админа в базу, чтобы потом убрать у них кнопку
+            conn = sqlite3.connect(DB_FILE)
+            cur = conn.cursor()
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS admin_notifications (ticket_id INTEGER, admin_id INTEGER, message_id INTEGER)"
+            )
+            cur.execute(
+                "INSERT INTO admin_notifications VALUES (?, ?, ?)",
+                (ticket_id, admin_id, sent_msg.message_id),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logging.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+
+
+# --- МОИ ОБРАЩЕНИЯ ---
+@dp.callback_query(F.data == "my_tickets")
+async def show_my_tickets(callback: CallbackQuery):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, category, status, created_at FROM tickets WHERE user_id = ? ORDER BY id DESC LIMIT 5",
+        (callback.from_user.id,),
+    )
+    tickets = cursor.fetchall()
+    conn.close()
+
+    if not tickets:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ В меню", callback_data="back_main"
+                    )
+                ]
+            ]
+        )
+        await callback.message.edit_text(
+            "📂 У вас пока нет активных обращений.", reply_markup=kb
+        )
+        await callback.answer()
         return
-    await message.answer("Выберите действие:", reply_markup=main_menu())
+
+    text = "📂 <b>Ваши последние обращения:</b>\n\n"
+    for t_id, cat, status, date in tickets:
+        text += f"🔹 <b>#{t_id}</b> | {cat}\n📅 {date}\nСтатус: {status}\n\n"
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📋 Создать еще", callback_data="new_ticket"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ В меню", callback_data="back_main"
+                )
+            ],
+        ]
+    )
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
 
 
-# ============================================================
-# ЗАПУСК
-# ============================================================
+# --- ОТВЕТ АДМИНА И УДАЛЕНИЕ КНОПОК У ДРУГИХ ---
+@dp.callback_query(F.data.startswith("reply_"))
+async def admin_start_reply(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("У вас нет прав администратора!", show_alert=True)
+        return
 
+    parts = callback.data.split("_")
+    ticket_id = parts[1]
+    target_user_id = int(parts[2])
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT status FROM tickets WHERE id = ?", (ticket_id,))
+    row = cursor.fetchone()
+
+    if not row:
+        conn.close()
+        await callback.answer("Тикет не найден.", show_alert=True)
+        return
+
+    if "Решено" in row[0]:
+        conn.close()
+        await callback.answer(
+            "⚠️ Этот тикет уже обработан другим администратором!", show_alert=True
+        )
+        # Убираем кнопку у текущего нажавшего, раз он уже не актуален
+        try:
+            await callback.message.edit_text(
+                callback.message.text
+                + "\n\n❌ <i>Тикет уже закрыт другим администратором.</i>"
+            )
+        except Exception:
+            pass
+        return
+
+    conn.close()
+
+    await state.set_state(FeedbackState.replying_to_user)
+    await state.update_data(
+        target_user_id=target_user_id, ticket_id=ticket_id
+    )
+
+    await callback.message.answer(
+        f"✍️ Введите текст ответа для тикета <b>#{ticket_id}</b>:"
+    )
+    await callback.answer()
+
+
+@dp.message(StateFilter(FeedbackState.replying_to_user))
+async def admin_send_reply(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    data = await state.get_data()
+    target_user_id = data.get("target_user_id")
+    ticket_id = data.get("ticket_id")
+    reply_text = message.text
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT status FROM tickets WHERE id = ?", (ticket_id,))
+    row = cursor.fetchone()
+
+    if row and "Решено" in row[0]:
+        conn.close()
+        await state.clear()
+        await message.answer("⚠️ Ошибка: этот тикет уже был закрыт ранее.")
+        return
+
+    # Меняем статус на «Решено ✅»
+    cursor.execute(
+        "UPDATE tickets SET status = 'Решено ✅' WHERE id = ?", (ticket_id,)
+    )
+
+    # Достаем все сохраненные сообщения этого тикета для других админов
+    cursor.execute(
+        "SELECT admin_id, message_id FROM admin_notifications WHERE ticket_id = ?",
+        (ticket_id,),
+    )
+    notifications = cursor.fetchall()
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+
+    # Убираем кнопки «Ответить» у ВСЕХ администраторов (включая того, кто ответил)
+    for adm_id, msg_id in notifications:
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=adm_id,
+                message_id=msg_id,
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="✅ Обработано (Закрыто)",
+                                callback_data="ignored",
+                            )
+                        ]
+                    ]
+                ),
+            )
+        except Exception:
+            pass
+
+    # Отправляем ответ пользователю
+    try:
+        await bot.send_message(
+            target_user_id,
+            f"📬 <b>Получен ответ по вашему обращению #{ticket_id}:</b>\n\n"
+            f"{reply_text}\n\n"
+            f"<i>Спасибо, что помогаете делать ВкусВилл лучше! 💚</i>",
+        )
+        await message.answer(
+            f"✅ Ответ успешно отправлен! Тикет #{ticket_id} закрыт, у других администраторов уведомление обновилось."
+        )
+    except Exception as e:
+        await message.answer(
+            f"⚠️ Не удалось отправить сообщение пользователю: {e}"
+        )
+
+
+@dp.callback_query(F.data == "ignored")
+async def ignored_cb(callback: CallbackQuery):
+    await callback.answer(
+        "Этот тикет уже обработан кем-то из коллег.", show_alert=True
+    )
+
+
+# --- ЗАПУСК БОТА ---
 async def main():
     init_db()
-    logging.info("🤖 Анонимный бот запущен")
+    logging.info("🤖 Бот запущен")
     await dp.start_polling(bot)
 
 
