@@ -2,11 +2,12 @@ from datetime import datetime
 import asyncio
 import logging
 import os
-from aiogram import Bot, Dispatcher, F, Router
+import sqlite3
+from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 
-# --- CONFIGURATION ---
+# --- CONFIG ---
 TOKEN = os.getenv("BOT_TOKEN")
 ADMINS_FILE = "admins.txt"
 SUPER_ADMIN_ID = 762076580
@@ -18,7 +19,29 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# --- PERSISTENT ADMIN STORAGE ---
+# --- DATABASE SETUP ---
+def init_db():
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS appeals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            user_name TEXT,
+            category TEXT,
+            text TEXT,
+            is_anon INTEGER,
+            status TEXT DEFAULT 'new',
+            admin_id INTEGER,
+            created_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# --- ADMINS ---
 def load_admins():
     admins = {SUPER_ADMIN_ID}
     if os.path.exists(ADMINS_FILE):
@@ -34,37 +57,28 @@ def save_admins(admins):
             f.write(f"{admin_id}\n")
 
 # --- STATES ---
+waiting_for_text = {}       # {user_id: {"category": str}}
+pending_appeals = {}         # {user_id: {"category": str, "text": str}}
+admin_reply_states = {}      # {admin_id: appeal_id}
+pending_admin_replies = {}   # {admin_id: {"appeal_id": int, "target_user_id": int, "msg": Message}}
 adding_admin_process = set()
 removing_admin_process = set()
-waiting_for_appeal_text = set()
-
-# Временное хранилище: {user_id: {"category": str, "text": str}}
-pending_appeals = {}
-
-# --- IMAGES ---
-IMG_NIGHT = "image.png"     
-IMG_EVENING = "image_2.png" 
-IMG_MORNING = "image_3.png" 
-IMG_DAY = "image_4.png"     
-IMG_THANKS = "image_5.png"  
 
 # --- KEYBOARDS ---
 employee_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="💡 Новые идеи"), KeyboardButton(text="⚠️ Жалобы")],
-        [KeyboardButton(text="⚔️ Конфликт"), KeyboardButton(text="🤝 Помощь сотруднику")],
-        [KeyboardButton(text="🌴 Отпуска"), KeyboardButton(text="🏥 Больничные")],
-        [KeyboardButton(text="⏱️ Графики и перерывы"), KeyboardButton(text="📋 Обязанности кассира")],
-        [KeyboardButton(text="💬 Другие вопросы")]
+        [KeyboardButton(text="✍️ Анонимное обращение"), KeyboardButton(text="💡 Новые идеи")],
+        [KeyboardButton(text="⚠️ Жалобы"), KeyboardButton(text="⚔️ Конфликт")],
+        [KeyboardButton(text="🤝 Помощь сотруднику"), KeyboardButton(text="💬 Другие вопросы")],
+        [KeyboardButton(text="🌴 Отпуска"), KeyboardButton(text="🏥 Больничные")]
     ],
     resize_keyboard=True
 )
 
 admin_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📊 Статистика бота"), KeyboardButton(text="📁 Актуальные обращения")],
-        [KeyboardButton(text="👥 Управление админами"), KeyboardButton(text="📈 Отчеты по дисциплине")],
-        [KeyboardButton(text="🔙 В обычное меню")]
+        [KeyboardButton(text="📊 Статистика бота"), KeyboardButton(text="📁 Обращения за месяц")],
+        [KeyboardButton(text="👥 Управление админами"), KeyboardButton(text="🔙 В меню сотрудника")]
     ],
     resize_keyboard=True
 )
@@ -82,13 +96,7 @@ cancel_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# --- TEXTS ДЛЯ СПРАВОЧНИКА ---
-VACATION_TEXT = "🌴 **Информация по отпускам:**\n\n• Заявление подается за 2 недели до начала."
-SICK_LEAVE_TEXT = "🏥 **Порядок по больничным листам:**\n\n• После закрытия больничного отправьте его номер в кадры."
-SCHEDULE_TEXT = "⏱️ **График и рабочее время:**\n\n• Используется приложение «Работа со Вкусом»."
-DUTIES_TEXT = "📋 **Основные обязанности:**\n\n• Сбор заказов, контроль сроков годности."
-
-# --- HANDLERS ---
+# --- HANDLERS: START ---
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     hour = datetime.now().hour
@@ -101,102 +109,285 @@ async def cmd_start(message: Message):
 
     admins = load_admins()
     if user_id in admins:
-        text = f"{greeting} Приветствую, Администратор! 👑\nПанель управления активирована."
-        keyboard = admin_keyboard
+        await message.answer(f"{greeting} Панель администратора активна:", reply_markup=admin_keyboard)
     else:
-        text = f"{greeting} 👋 Твой личный помощник во ВкусВилле на связи. Выберите нужную категорию обращения или раздел:"
-        keyboard = employee_keyboard
+        await message.answer(f"{greeting} 👋 Твой личный помощник во ВкусВилле на связи. Выберите категорию обращения:", reply_markup=employee_keyboard)
 
-    try:
-        await message.answer_photo(photo=FSInputFile(IMG_MORNING), caption=text, reply_markup=keyboard)
-    except Exception:
-        await message.answer(text, reply_markup=keyboard)
-
-async def send_response_with_appeal_button(message: Message, text: str, category: str):
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=f"✍️ Написать по теме: {category}", callback_data=f"cat_{category}")]]
-    )
-    try:
-        await message.answer_photo(photo=FSInputFile(IMG_THANKS), caption=text, parse_mode="Markdown", reply_markup=keyboard)
-    except Exception:
-        await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
-
-# Перехват нажатий на категории или инлайн-кнопки
-categories_list = ["💡 Новые идеи", "⚠️ Жалобы", "⚔️ Конфликт", "🤝 Помощь сотруднику", "💬 Другие вопросы", "🌴 Отпуска", "🏥 Больничные", "⏱️ Графики и перерывы", "📋 Обязанности кассира"]
-
-@router.message(F.text.in_(categories_list))
-async def handle_category_selection(message: Message):
-    user_id = message.from_user.id
-    category = message.text
-    
-    # Если это чисто справочные темы — выдаем справку с кнопкой, остальные сразу просят текст обращения
-    if category == "🌴 Отпуска":
-        await send_response_with_appeal_button(message, VACATION_TEXT, category)
-        return
-    elif category == "🏥 Больничные":
-        await send_response_with_appeal_button(message, SICK_LEAVE_TEXT, category)
-        return
-    elif category == "⏱️ Графики и перерывы":
-        await send_response_with_appeal_button(message, SCHEDULE_TEXT, category)
-        return
-    elif category == "📋 Обязанности кассира":
-        await send_response_with_appeal_button(message, DUTIES_TEXT, category)
-        return
-
-    # Для категорий обращений запускаем сбор текста
-    waiting_for_appeal_text.add(user_id)
-    pending_appeals[user_id] = {"category": category}
-    await message.answer(
-        f"✍️ Вы выбрали категорию: **{category}**\n\nНапишите суть вашего обращения одним сообщением:",
-        reply_markup=cancel_keyboard,
-        parse_mode="Markdown"
-    )
-
-@router.callback_query(F.data.startswith("cat_"))
-async def callback_category_selection(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    category = callback.data.replace("cat_", "")
-    
-    waiting_for_appeal_text.add(user_id)
-    pending_appeals[user_id] = {"category": category}
-    
-    await callback.message.answer(
-        f"✍️ Вы выбрали категорию: **{category}**\n\nНапишите суть вашего обращения одним сообщением:",
-        reply_markup=cancel_keyboard,
-        parse_mode="Markdown"
-    )
-    await callback.answer()
+@router.message(F.text == "🔙 В меню сотрудника")
+async def back_to_emp(message: Message):
+    if message.from_user.id in load_admins():
+        await message.answer("Меню сотрудника:", reply_markup=employee_keyboard)
 
 @router.message(F.text == "🔙 Отменить и в меню")
 async def cancel_action(message: Message):
     user_id = message.from_user.id
-    waiting_for_appeal_text.discard(user_id)
+    waiting_for_text.pop(user_id, None)
+    pending_appeals.pop(user_id, None)
+    admin_reply_states.pop(user_id, None)
+    pending_admin_replies.pop(user_id, None)
     adding_admin_process.discard(user_id)
     removing_admin_process.discard(user_id)
-    pending_appeals.pop(user_id, None)
     
-    admins = load_admins()
-    if user_id in admins:
-        await message.answer("Возвращаюсь в админ-панель:", reply_markup=admin_keyboard)
+    if user_id in load_admins():
+        await message.answer("Админ-панель:", reply_markup=admin_keyboard)
     else:
         await message.answer("Главное меню:", reply_markup=employee_keyboard)
+
+# --- HANDLERS: EMPLOYEE APPEALS ---
+categories = ["✍️ Анонимное обращение", "💡 Новые идеи", "⚠️ Жалобы", "⚔️ Конфликт", "🤝 Помощь сотруднику", "💬 Другие вопросы", "🌴 Отпуска", "🏥 Больничные"]
+
+@router.message(F.text.in_(categories))
+async def select_category(message: Message):
+    user_id = message.from_user.id
+    cat = message.text
+    if cat == "🌴 Отпуска":
+        await message.answer("🌴 **Информация по отпускам:** заявление подается за 2 недели.", parse_mode="Markdown")
+        return
+    elif cat == "🏥 Больничные":
+        await message.answer("🏥 **Больничные:** отправьте номер закрытого больничного в кадры.", parse_mode="Markdown")
+        return
+
+    waiting_for_text[user_id] = {"category": cat}
+    await message.answer(f"✍️ Вы выбрали: **{cat}**\n\nНапишите ваш вопрос или проблему одним сообщением:", reply_markup=cancel_keyboard, parse_mode="Markdown")
+
+@router.message(F.text & F.from_user.id.in_(waiting_for_text))
+async def get_appeal_text(message: Message):
+    user_id = message.from_user.id
+    cat_data = waiting_for_text.pop(user_id)
+    pending_appeals[user_id] = {"category": cat_data["category"], "text": message.text}
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🕵️‍♂️ Отправить анонимно", callback_data="send_anon")],
+        [InlineKeyboardButton(text="👤 Отправить с именем", callback_data="send_named")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_send")]
+    ])
+    await message.answer(f"📄 **Проверьте текст обращения:**\n\n> {message.text}\n\nКак отправить?", reply_markup=kb, parse_mode="Markdown")
+
+@router.callback_query(F.data.in_({"send_anon", "send_named"}))
+async def confirm_send_appeal(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    data = pending_appeals.pop(user_id, None)
+    if not data:
+        await callback.answer("Сессия истекла.", show_alert=True)
+        return
+
+    is_anon = (callback.data == "send_anon")
+    user = callback.from_user
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO appeals (user_id, user_name, category, text, is_anon, status, created_at)
+        VALUES (?, ?, ?, ?, ?, 'new', ?)
+    """, (user.id, user.full_name, data["category"], data["text"], 1 if is_anon else 0, now))
+    appeal_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    if is_anon:
+        header = f"🚨 **Новое АНОНИМНОЕ обращение (ID: {appeal_id})**\n📂 **Категория:** {data['category']}"
+    else:
+        username = f" (@{user.username})" if user.username else ""
+        header = f"🚨 **Обращение от сотрудника (ID: {appeal_id})**: {user.full_name}{username}\n📂 **Категория:** {data['category']}"
+
+    full_text = f"{header}\n\n{data['text']}"
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Взять в работу / Ответить", callback_data=f"take_{appeal_id}")]
+    ])
+
+    for admin_id in load_admins():
+        try:
+            await bot.send_message(admin_id, full_text, parse_mode="Markdown", reply_markup=admin_kb)
+        except Exception:
+            pass
+
+    await callback.message.edit_text("✅ Ваше обращение успешно отправлено администраторам!", reply_markup=None)
+    try:
+        await callback.message.answer_photo(photo=FSInputFile("image_5.png"), caption="Спасибо, что вы с нами! Мы на связи и готовы ПОМОЧЬ 💚")
+    except Exception:
+        pass
+    await callback.answer()
+
+@router.callback_query(F.data == "cancel_send")
+async def cancel_send(callback: CallbackQuery):
+    pending_appeals.pop(callback.from_user.id, None)
+    await callback.message.edit_text("❌ Отправка отменена.", reply_markup=None)
+    await callback.answer()
+
+# --- HANDLERS: ADMIN ACTIONS & REPLIES ---
+@router.callback_query(F.data.startswith("take_"))
+async def take_appeal(callback: CallbackQuery):
+    admin_id = callback.from_user.id
+    if admin_id not in load_admins():
+        await callback.answer("У вас нет прав администратора.", show_alert=True)
+        return
+
+    appeal_id = int(callback.data.split("_")[1])
+
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT status, admin_id, user_id FROM appeals WHERE id = ?", (appeal_id,))
+    row = cursor.fetchone()
+
+    if not row:
+        conn.close()
+        await callback.answer("Обращение не найдено в базе.", show_alert=True)
+        return
+
+    status, current_admin, target_user_id = row
+
+    if status == 'in_progress' and current_admin != admin_id:
+        conn.close()
+        await callback.answer("⚠️ Это обращение уже взял в работу другой администратор!", show_alert=True)
+        return
+    elif status == 'closed':
+        conn.close()
+        await callback.answer("⚠️ Это обращение уже закрыто.", show_alert=True)
+        return
+
+    cursor.execute("UPDATE appeals SET status = 'in_progress', admin_id = ? WHERE id = ?", (admin_id, appeal_id))
+    conn.commit()
+    conn.close()
+
+    admin_reply_states[admin_id] = {"appeal_id": appeal_id, "target_user_id": target_user_id}
+    
+    await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔒 В работе у вас", callback_data="noop")],
+        [InlineKeyboardButton(text="✅ Завершить диалог", callback_data=f"close_{appeal_id}")]
+    ]))
+    await callback.message.answer(f"✍️ Вы взяли обращение **№{appeal_id}** в работу.\n\nОтправьте текстом, картинкой или файлом ваш ответ (перед отправкой бот попросит подтверждение).", parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("close_"))
+async def close_appeal(callback: CallbackQuery):
+    admin_id = callback.from_user.id
+    appeal_id = int(callback.data.split("_")[1])
+
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE appeals SET status = 'closed' WHERE id = ?", (appeal_id,))
+    conn.commit()
+    conn.close()
+
+    admin_reply_states.pop(admin_id, None)
+    pending_admin_replies.pop(admin_id, None)
+    await callback.message.edit_text(callback.message.text + "\n\n✅ *Диалог закрыт администратором.*", parse_mode="Markdown", reply_markup=None)
+    await callback.answer("Обращение закрыто!")
+
+@router.callback_query(F.data == "noop")
+async def noop(callback: CallbackQuery):
+    await callback.answer("Обращение уже обрабатывается.", show_alert=True)
+
+# Шаг 1: Админ присылает ответ, бот запрашивает подтверждение
+@router.message(F.from_user.id.in_(admin_reply_states))
+async def admin_prepare_reply(message: Message):
+    admin_id = message.from_user.id
+    state = admin_reply_states.get(admin_id)
+    if not state:
+        return
+
+    pending_admin_replies[admin_id] = {
+        "appeal_id": state["appeal_id"],
+        "target_user_id": state["target_user_id"],
+        "msg": message
+    }
+
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, отправить сотруднику", callback_data="confirm_admin_reply")],
+        [InlineKeyboardButton(text="❌ Отменить / Переписать", callback_data="cancel_admin_reply")]
+    ])
+
+    await message.answer("⚠️ **Проверьте ваш ответ перед отправкой:**\nЭто сообщение увидит сотрудник.", reply_markup=confirm_kb, parse_mode="Markdown")
+
+# Шаг 2: Обработка кнопок подтверждения от админа
+@router.callback_query(F.data.in_({"confirm_admin_reply", "cancel_admin_reply"}))
+async def admin_reply_confirmation(callback: CallbackQuery):
+    admin_id = callback.from_user.id
+    reply_data = pending_admin_replies.pop(admin_id, None)
+
+    if callback.data == "cancel_admin_reply":
+        await callback.message.edit_text("❌ Отправка ответа отменена. Можете отправить другой вариант.", reply_markup=None)
+        await callback.answer()
+        return
+
+    if not reply_data:
+        await callback.message.edit_text("⚠️ Данные устарели или сессия истекла.", reply_markup=None)
+        await callback.answer()
+        return
+
+    target_user_id = reply_data["target_user_id"]
+    appeal_id = reply_data["appeal_id"]
+    msg = reply_data["msg"]
+
+    try:
+        if msg.photo:
+            await bot.send_photo(target_user_id, photo=msg.photo[-1].file_id, caption=f"💬 **Ответ от администрации по обращению №{appeal_id}:**\n{msg.caption or ''}", parse_mode="Markdown")
+        elif msg.document:
+            await bot.send_document(target_user_id, document=msg.document.file_id, caption=f"💬 **Ответ от администрации по обращению №{appeal_id}:**\n{msg.caption or ''}", parse_mode="Markdown")
+        elif msg.text:
+            await bot.send_message(target_user_id, f"💬 **Ответ от администрации по обращению №{appeal_id}:**\n\n{msg.text}", parse_mode="Markdown")
+        
+        await callback.message.edit_text("✅ Ответ успешно доставлен сотруднику!", reply_markup=None)
+    except Exception as e:
+        await callback.message.edit_text(f"❌ Не удалось отправить ответ пользователю (возможно, он заблокировал бота): {e}", reply_markup=None)
+    
+    await callback.answer()
+
+# --- ADMIN PANEL BUTTONS ---
+@router.message(F.text == "📊 Статистика бота")
+async def admin_stats(message: Message):
+    if message.from_user.id not in load_admins(): return
+    today = datetime.now().strftime("%Y-%m-%d")
+    
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM appeals WHERE created_at LIKE ?", (f"{today}%",))
+    count_today = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM appeals")
+    count_total = cursor.fetchone()[0]
+    conn.close()
+
+    await message.answer(f"📊 **Статистика бота:**\n\n• Обращений за сегодня: {count_today}\n• Всего обращений за всё время: {count_total}", parse_mode="Markdown")
+
+@router.message(F.text == "📁 Обращения за месяц")
+async def admin_month_appeals(message: Message):
+    if message.from_user.id not in load_admins(): return
+    current_month = datetime.now().strftime("%Y-%m")
+
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, category, status, created_at FROM appeals WHERE created_at LIKE ? ORDER BY id DESC LIMIT 20", (f"{current_month}%",))
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        await message.answer(f"📁 За текущий месяц ({current_month}) обращений пока нет.")
+        return
+
+    text = f"📁 **Обращения за {current_month} (последние 20):**\n\n"
+    for r in rows:
+        status_emoji = "🆕" if r[2] == 'new' else ("🟡" if r[2] == 'in_progress' else "✅")
+        text += f"{status_emoji} **№{r[0]}** | [{r[1]}] | Статус: `{r[2]}` | {r[3]}\n"
+
+    await message.answer(text, parse_mode="Markdown")
 
 @router.message(F.text == "👥 Управление админами")
 async def admin_manage_menu(message: Message):
     if message.from_user.id in load_admins():
-        await message.answer("👥 Меню управления администраторами:", reply_markup=manage_admins_keyboard)
+        await message.answer("👥 Управление администраторами:", reply_markup=manage_admins_keyboard)
 
 @router.message(F.text == "🔙 Назад в админ-панель")
 async def back_to_admin(message: Message):
     if message.from_user.id in load_admins():
-        await message.answer("Возвращаюсь в панель управления:", reply_markup=admin_keyboard)
+        await message.answer("Панель управления:", reply_markup=admin_keyboard)
 
 @router.message(F.text == "📋 Список админов")
 async def list_admins(message: Message):
     if message.from_user.id in load_admins():
         admins = load_admins()
-        admins_list_str = "\n".join([f"• `{aid}`" for aid in admins])
-        await message.answer(f"📋 **Список текущих администраторов:**\n\n{admins_list_str}", parse_mode="Markdown")
+        lst = "\n".join([f"• `{aid}`" for aid in admins])
+        await message.answer(f"📋 **Список администраторов:**\n\n{lst}", parse_mode="Markdown")
 
 @router.message(F.text == "➕ Добавить админа")
 async def ask_add_admin(message: Message):
@@ -208,10 +399,10 @@ async def ask_add_admin(message: Message):
 async def ask_remove_admin(message: Message):
     if message.from_user.id in load_admins():
         removing_admin_process.add(message.from_user.id)
-        await message.answer("✍️ Отправьте **Telegram ID** администратора, которого нужно удалить:", parse_mode="Markdown", reply_markup=cancel_keyboard)
+        await message.answer("✍️ Отправьте **Telegram ID** администратора для удаления:", parse_mode="Markdown", reply_markup=cancel_keyboard)
 
 @router.message(F.text)
-async def process_text(message: Message):
+async def process_admin_mutations(message: Message):
     user_id = message.from_user.id
     text = message.text.strip()
     admins = load_admins()
@@ -221,11 +412,11 @@ async def process_text(message: Message):
         if text.isdigit():
             admins.add(int(text))
             save_admins(admins)
-            await message.answer(f"✅ Пользователь `{text}` успешно добавлен!", parse_mode="Markdown", reply_markup=manage_admins_keyboard)
+            await message.answer(f"✅ Администратор `{text}` успешно добавлен!", parse_mode="Markdown", reply_markup=manage_admins_keyboard)
         else:
             await message.answer("❌ Ошибка. ID должен состоять только из цифр.", reply_markup=manage_admins_keyboard)
         return
-    
+
     if user_id in removing_admin_process:
         removing_admin_process.remove(user_id)
         if text.isdigit():
@@ -235,115 +426,18 @@ async def process_text(message: Message):
             elif rem_id in admins:
                 admins.remove(rem_id)
                 save_admins(admins)
-                await message.answer(f"🗑️ Пользователь `{rem_id}` удален.", reply_markup=manage_admins_keyboard)
+                await message.answer(f"🗑️ Администратор `{rem_id}` удален.", reply_markup=manage_admins_keyboard)
             else:
                 await message.answer("⚠️ Такого ID нет в списке.", reply_markup=manage_admins_keyboard)
         else:
             await message.answer("❌ Ошибка. ID должен состоять только из цифр.", reply_markup=manage_admins_keyboard)
         return
 
-    # Обработка введенного текста обращения -> предложение выбрать анонимность
-    if user_id in waiting_for_appeal_text:
-        waiting_for_appeal_text.remove(user_id)
-        if user_id in pending_appeals:
-            pending_appeals[user_id]["text"] = text
-        else:
-            pending_appeals[user_id] = {"category": "💬 Другие вопросы", "text": text}
-
-        category = pending_appeals[user_id]["category"]
-        confirm_keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🕵️‍♂️ Отправить анонимно", callback_data="send_anon")],
-                [InlineKeyboardButton(text="👤 Отправить с именем", callback_data="send_named")],
-                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_send")]
-            ]
-        )
-        await message.answer(
-            f"📁 **Категория:** {category}\n📄 **Ваш текст:**\n\n> {text}\n\nКак вы хотите отправить это обращение?",
-            parse_mode="Markdown",
-            reply_markup=confirm_keyboard
-        )
-        return
-
-    # Действия админа
-    if user_id in admins:
-        if text == "🔙 В обычное меню":
-            await message.answer("Переключаюсь в меню сотрудника:", reply_markup=employee_keyboard)
-            return
-        elif text == "📊 Статистика бота":
-            await message.answer("📊 **Статистика бота:**\n\n• Обращений за сегодня: 0", parse_mode="Markdown")
-            return
-        elif text == "📁 Актуальные обращения":
-            await message.answer("📁 **Актуальные обращения:**\n\nВсе новые заявки поступают сюда с указанием категории.", parse_mode="Markdown")
-            return
-        elif text == "📈 Отчеты по дисциплине":
-            await message.answer("📈 **Отчеты по дисциплине:**\n\n• Нарушений не зафиксировано.", parse_mode="Markdown")
-            return
-
-    # Если бот не понял текст
-    if user_id in admins:
-        await message.answer("Админ-панель:", reply_markup=admin_keyboard)
-    else:
-        await message.answer(
-            "Хм, я не совсем понял запрос 🤔 Воспользуйтесь кнопками меню ниже:",
-            reply_markup=employee_keyboard
-        )
-
-# --- ФИНАЛЬНАЯ ОТПРАВКА АДМИНАМ ---
-@router.callback_query(F.data.in_({"send_anon", "send_named", "cancel_send"}))
-async def process_appeal_choice(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    data = pending_appeals.pop(user_id, None)
-
-    if callback.data == "cancel_send":
-        await callback.message.edit_text("❌ Отправка обращения отменена.", reply_markup=None)
-        await callback.answer()
-        return
-
-    if not data:
-        await callback.message.edit_text("⚠️ Срок действия сессии истек.", reply_markup=None)
-        await callback.answer()
-        return
-
-    category = data.get("category", "💬 Другие вопросы")
-    text = data.get("text", "")
-
-    is_anon = (callback.data == "send_anon")
-    if is_anon:
-        header = f"🚨 **Новое АНОНИМНОЕ обращение**\n📂 **Категория:** {category}"
-    else:
-        user_name = callback.from_user.full_name
-        username = f" (@{callback.from_user.username})" if callback.from_user.username else ""
-        header = f"🚨 **Обращение от сотрудника:** {user_name}{username} (ID: `{user_id}`)\n📂 **Категория:** {category}"
-
-    appeal_full_text = f"{header}\n\n{text}"
-    admins = load_admins()
-
-    admin_action_keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="✅ Подтвердить / Прочитано", callback_data="admin_ack")]]
-    )
-
-    for admin_id in admins:
-        try:
-            await bot.send_message(admin_id, appeal_full_text, parse_mode="Markdown", reply_markup=admin_action_keyboard)
-        except Exception:
-            pass
-
-    await callback.message.edit_text("✅ Ваше обращение успешно отправлено администраторам!", reply_markup=None)
-    await callback.answer()
-
-@router.callback_query(F.data == "admin_ack")
-async def admin_acknowledge(callback: CallbackQuery):
-    if callback.from_user.id in load_admins():
-        await callback.message.edit_text(callback.message.text + "\n\n✅ *Обращение отмечено как прочитанное.*", parse_mode="Markdown")
-        await callback.answer("Статус обновлен!")
-    else:
-        await callback.answer("У вас нет прав администратора.", show_alert=True)
-
+# --- MAIN RUN ---
 async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    print("🤖 Бот успешно запущен!")
+    print("🤖 Бот с защитой отправки ответов успешно запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
