@@ -142,7 +142,6 @@ async def select_category(message: Message):
     waiting_for_text[message.from_user.id] = {"category": message.text}
     await message.answer(f"✍️ Вы выбрали: {message.text}\nНапишите ваш вопрос (можно прикрепить фото):", reply_markup=cancel_keyboard)
 
-# Обработка текста или фото от сотрудника
 @router.message((F.text | F.photo) & F.from_user.id.in_(waiting_for_text))
 async def get_appeal_content(message: Message):
     user_id = message.from_user.id
@@ -165,16 +164,21 @@ async def get_appeal_content(message: Message):
         [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_send")]
     ])
     
+    confirm_text = f"📄 Категория: {cat_data['category']}\nТекст: {text}\n\nВсё верно? Отправляем?"
+    
     if photo_id:
-        await message.answer_photo(photo=photo_id, caption=f"📄 Категория: {cat_data['category']}\nТекст: {text}\n\nВсё верно? Отправляем?", reply_markup=kb)
+        await message.answer_photo(photo=photo_id, caption=confirm_text, reply_markup=kb)
     else:
-        await message.answer(f"📄 Категория: {cat_data['category']}\nТекст: {text}\n\nВсё верно? Отправляем?", reply_markup=kb)
+        await message.answer(confirm_text, reply_markup=kb)
 
 @router.callback_query(F.data == "cancel_send")
 async def cancel_send_callback(callback: CallbackQuery):
     pending_appeals.pop(callback.from_user.id, None)
-    await callback.message.edit_text("❌ Отправка отменена.")
-    await callback.message.answer("Главное меню:", reply_markup=employee_keyboard)
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    await callback.message.answer("❌ Отправка отменена.", reply_markup=employee_keyboard)
     await callback.answer()
 
 @router.callback_query(F.data == "proceed_send")
@@ -188,7 +192,12 @@ async def ask_anonymity_callback(callback: CallbackQuery):
         [InlineKeyboardButton(text="🕵️‍♂️ Анонимно", callback_data="send_anon")],
         [InlineKeyboardButton(text="👤 С именем", callback_data="send_named")]
     ])
-    await callback.message.edit_text("Выберите способ отправки обращения:", reply_markup=kb)
+    
+    await callback.message.answer("Выберите способ отправки обращения:", reply_markup=kb)
+    try:
+        await callback.message.delete()
+    except:
+        pass
     await callback.answer()
 
 @router.callback_query(F.data.in_({"send_anon", "send_named"}))
@@ -223,11 +232,14 @@ async def confirm_send_appeal(callback: CallbackQuery):
         except: 
             pass
 
-    await callback.message.edit_text("✅ Обращение успешно отправлено!")
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    await callback.message.answer("✅ Обращение успешно отправлено!")
     await callback.message.answer_photo(photo=FSInputFile("image_5.png"), caption="Спасибо, что вы с нами! Мы на связи и готовы ПОМОЧЬ 💚")
     await callback.answer()
 
-# --- ЛОГИКА ОТВЕТОВ АДМИНА С ПОДТВЕРЖДЕНИЕМ И ФОТО ---
 @router.callback_query(F.data.startswith("reply_appeal_"))
 async def start_admin_reply(callback: CallbackQuery):
     if callback.from_user.id not in load_admins():
@@ -246,6 +258,9 @@ async def get_admin_reply_content(message: Message):
     appeal_id = admin_reply_states.pop(admin_id)
     
     text = message.caption if message.photo else message.text
+    if not text:
+        text = "Без текста (только фото)"
+        
     photo_id = message.photo[-1].file_id if message.photo else None
     
     pending_admin_confirm[admin_id] = {
@@ -268,8 +283,11 @@ async def get_admin_reply_content(message: Message):
 @router.callback_query(F.data == "cancel_admin_reply")
 async def cancel_admin_reply_cb(callback: CallbackQuery):
     pending_admin_confirm.pop(callback.from_user.id, None)
-    await callback.message.edit_text("❌ Отправка ответа отменена.")
-    await callback.message.answer("Админ-панель:", reply_markup=admin_keyboard)
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    await callback.message.answer("❌ Отправка ответа отменена.", reply_markup=admin_keyboard)
     await callback.answer()
 
 @router.callback_query(F.data == "confirm_admin_reply")
@@ -300,14 +318,24 @@ async def execute_admin_reply(callback: CallbackQuery):
                 await bot.send_photo(target_user_id, photo=photo_id, caption=full_reply)
             else:
                 await bot.send_message(target_user_id, full_reply)
-            await callback.message.edit_text("✅ Ответ успешно отправлен сотруднику!")
-            await callback.message.answer("Админ-панель:", reply_markup=admin_keyboard)
+            
+            try:
+                await callback.message.delete()
+            except:
+                pass
+            await callback.message.answer("✅ Ответ успешно отправлен сотруднику!", reply_markup=admin_keyboard)
         except:
-            await callback.message.edit_text("⚠️ Не удалось отправить сообщение сотруднику (возможно, он заблокировал бота).")
-            await callback.message.answer("Админ-панель:", reply_markup=admin_keyboard)
+            try:
+                await callback.message.delete()
+            except:
+                pass
+            await callback.message.answer("⚠️ Не удалось отправить сообщение сотруднику (возможно, он заблокировал бота).", reply_markup=admin_keyboard)
     else:
-        await callback.message.edit_text("❌ Ошибка: обращение не найдено в базе данных.")
-        await callback.message.answer("Админ-панель:", reply_markup=admin_keyboard)
+        try:
+            await callback.message.delete()
+        except:
+            pass
+        await callback.message.answer("❌ Ошибка: обращение не найдено в базе данных.", reply_markup=admin_keyboard)
     conn.close()
     await callback.answer()
 
