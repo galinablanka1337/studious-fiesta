@@ -142,16 +142,33 @@ async def select_category(message: Message):
     waiting_for_text[message.from_user.id] = {"category": message.text}
     await message.answer(f"✍️ Вы выбрали: {message.text}\nНапишите ваш вопрос (можно прикрепить фото):", reply_markup=cancel_keyboard)
 
-@router.message((F.text | F.photo) & F.from_user.id.in_(waiting_for_text))
-async def get_appeal_content(message: Message):
+# Отдельный обработчик для текста от сотрудника
+@router.message(F.text & F.from_user.id.in_(waiting_for_text))
+async def get_appeal_text(message: Message):
     user_id = message.from_user.id
     cat_data = waiting_for_text.pop(user_id)
     
-    text = message.caption if message.photo else message.text
-    if not text:
-        text = "Без текста (только фото)"
-        
-    photo_id = message.photo[-1].file_id if message.photo else None
+    pending_appeals[user_id] = {
+        "category": cat_data["category"], 
+        "text": message.text, 
+        "photo_id": None
+    }
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтвердить и отправить", callback_data="proceed_send")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_send")]
+    ])
+    
+    await message.answer(f"📄 Категория: {cat_data['category']}\nТекст: {message.text}\n\nВсё верно? Отправляем?", reply_markup=kb)
+
+# Отдельный обработчик для фото от сотрудника
+@router.message(F.photo & F.from_user.id.in_(waiting_for_text))
+async def get_appeal_photo(message: Message):
+    user_id = message.from_user.id
+    cat_data = waiting_for_text.pop(user_id)
+    
+    text = message.caption if message.caption else "Без текста (только фото)"
+    photo_id = message.photo[-1].file_id
     
     pending_appeals[user_id] = {
         "category": cat_data["category"], 
@@ -164,12 +181,7 @@ async def get_appeal_content(message: Message):
         [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_send")]
     ])
     
-    confirm_text = f"📄 Категория: {cat_data['category']}\nТекст: {text}\n\nВсё верно? Отправляем?"
-    
-    if photo_id:
-        await message.answer_photo(photo=photo_id, caption=confirm_text, reply_markup=kb)
-    else:
-        await message.answer(confirm_text, reply_markup=kb)
+    await message.answer_photo(photo=photo_id, caption=f"📄 Категория: {cat_data['category']}\nТекст: {text}\n\nВсё верно? Отправляем?", reply_markup=kb)
 
 @router.callback_query(F.data == "cancel_send")
 async def cancel_send_callback(callback: CallbackQuery):
@@ -252,16 +264,33 @@ async def start_admin_reply(callback: CallbackQuery):
     await callback.message.answer(f"✍️ Введите ответ на обращение №{appeal_id} (можно прикрепить фото):", reply_markup=cancel_keyboard)
     await callback.answer()
 
-@router.message((F.text | F.photo) & F.from_user.id.in_(admin_reply_states))
-async def get_admin_reply_content(message: Message):
+# Отдельный обработчик для текстового ответа админа
+@router.message(F.text & F.from_user.id.in_(admin_reply_states))
+async def get_admin_reply_text(message: Message):
     admin_id = message.from_user.id
     appeal_id = admin_reply_states.pop(admin_id)
     
-    text = message.caption if message.photo else message.text
-    if not text:
-        text = "Без текста (только фото)"
-        
-    photo_id = message.photo[-1].file_id if message.photo else None
+    pending_admin_confirm[admin_id] = {
+        "appeal_id": appeal_id,
+        "text": message.text,
+        "photo_id": None
+    }
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Отправить ответ сотруднику", callback_data="confirm_admin_reply")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_admin_reply")]
+    ])
+    
+    await message.answer(f"📤 Проверьте ответ на обращение №{appeal_id}:\n\n{message.text}", reply_markup=kb)
+
+# Отдельный обработчик для фото-ответа админа
+@router.message(F.photo & F.from_user.id.in_(admin_reply_states))
+async def get_admin_reply_photo(message: Message):
+    admin_id = message.from_user.id
+    appeal_id = admin_reply_states.pop(admin_id)
+    
+    text = message.caption if message.caption else "Без текста (только фото)"
+    photo_id = message.photo[-1].file_id
     
     pending_admin_confirm[admin_id] = {
         "appeal_id": appeal_id,
@@ -274,11 +303,7 @@ async def get_admin_reply_content(message: Message):
         [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_admin_reply")]
     ])
     
-    preview_msg = f"📤 Проверьте ответ на обращение №{appeal_id}:\n\n{text}"
-    if photo_id:
-        await message.answer_photo(photo=photo_id, caption=preview_msg, reply_markup=kb)
-    else:
-        await message.answer(preview_msg, reply_markup=kb)
+    await message.answer_photo(photo=photo_id, caption=f"📤 Проверьте ответ на обращение №{appeal_id}:\n\n{text}", reply_markup=kb)
 
 @router.callback_query(F.data == "cancel_admin_reply")
 async def cancel_admin_reply_cb(callback: CallbackQuery):
