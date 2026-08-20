@@ -161,7 +161,7 @@ manage_admins_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-cancel_keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Отменить и в меню")]], resize_keyboard=True)
+cancel_keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Возврат в меню")]], resize_keyboard=True)
 
 # --- ФОНОВЫЕ ЗАДАЧИ ---
 
@@ -195,7 +195,7 @@ async def auto_close_inactive_tickets():
                     ])
                     await bot.send_message(
                         user_id, 
-                        f"🔒 Ваше обращение №{appeal_id} было автоматически закрыто (тайм-аут 3 дня).\nОцените качество работы поддержки:", 
+                        f"🔒 Ваше обращение №{appeal_id} было автоматически закрыто (тайм-аут 3 дня без ответа).\nОцените качество работы поддержки:", 
                         reply_markup=kb
                     )
                 except:
@@ -203,7 +203,7 @@ async def auto_close_inactive_tickets():
                 
                 for admin_id in load_admins():
                     try:
-                        await bot.send_message(admin_id, f"🔒 Обращение №{appeal_id} закрыто автоматически по тайм-ауту.")
+                        await bot.send_message(admin_id, f"🔒 Обращение №{appeal_id} закрыто автоматически по тайм-ауту (3 дня).")
                     except:
                         pass
             conn.close()
@@ -286,7 +286,7 @@ async def back_to_admin(message: Message):
     if message.from_user.id in load_admins():
         await message.answer("🛠 Панель администратора:", reply_markup=admin_keyboard)
 
-@router.message(F.text == "🔙 Отменить и в меню")
+@router.message(F.text == "🔙 Возврат в меню")
 async def cancel_action(message: Message):
     user_id = message.from_user.id
     waiting_for_text.pop(user_id, None)
@@ -363,13 +363,10 @@ async def execute_block_user(message: Message):
 @router.callback_query(F.data == "unblock_user_prompt")
 async def prompt_unblock_user(callback: CallbackQuery):
     if callback.from_user.id not in load_admins(): return
-    # Используем то же множественное отслеживание, либо можно добавить отдельный сет
     blocking_user_process.add(callback.from_user.id)
-    # Для простоты задействуем ту же логику ввода цифр, но сделаем разблокировку
     await callback.message.answer("🔓 Введите Telegram ID пользователя для разблокировки:", reply_markup=cancel_keyboard)
     await callback.answer()
 
-# Перехват ввода для разблокировки (если юзер в процессе блокировки/разблокировки)
 @router.message(F.text.isdigit() & F.from_user.id.in_(blocking_user_process))
 async def execute_unblock_user(message: Message):
     admin_id = message.from_user.id
@@ -388,7 +385,6 @@ async def execute_unblock_user(message: Message):
     except:
         pass
 
-# Кнопка быстрой блокировки прямо из карточки тикета
 @router.callback_query(F.data.startswith("ban_user_"))
 async def ban_user_from_ticket(callback: CallbackQuery):
     if callback.from_user.id not in load_admins(): return
@@ -716,6 +712,7 @@ async def confirm_send_appeal(callback: CallbackQuery):
 
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💬 Ответить в чат", callback_data=f"open_chat_{appeal_id}")],
+        [InlineKeyboardButton(text="📜 История", callback_data=f"view_room_{appeal_id}")],
         [InlineKeyboardButton(text="🔒 Закрыть", callback_data=f"close_appeal_{appeal_id}")],
         [InlineKeyboardButton(text="🚫 Заблокировать юзера", callback_data=f"ban_user_{appeal_id}")]
     ])
@@ -734,7 +731,7 @@ async def confirm_send_appeal(callback: CallbackQuery):
     employee_active_kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="✅ Вопрос решен (Закрыть тикет)")],
-            [KeyboardButton(text="🔙 Отменить и в меню")]
+            [KeyboardButton(text="🔙 Возврат в меню")]
         ],
         resize_keyboard=True
     )
@@ -782,6 +779,7 @@ async def employee_continue_dialog(message: Message):
 
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💬 Ответить", callback_data=f"open_chat_{appeal_id}")],
+        [InlineKeyboardButton(text="📜 История", callback_data=f"view_room_{appeal_id}")],
         [InlineKeyboardButton(text="🔒 Закрыть", callback_data=f"close_appeal_{appeal_id}")],
         [InlineKeyboardButton(text="🚫 Заблокировать юзера", callback_data=f"ban_user_{appeal_id}")]
     ])
@@ -815,12 +813,18 @@ async def admin_open_chat(callback: CallbackQuery):
     if callback.from_user.id not in load_admins(): return
     appeal_id = int(callback.data.split("_")[2])
     admin_dialogues[callback.from_user.id] = appeal_id
-    await callback.message.answer(f"✍️ Режим диалога по тикету №{appeal_id}. Пишите ответ сотруднику:", reply_markup=cancel_keyboard)
+    await callback.message.answer(f"✍️ Режим диалога по тикету №{appeal_id}. Пишите ответы сотруднику (сколько угодно сообщений). Для выхода нажмите кнопку ниже:", reply_markup=cancel_keyboard)
     await callback.answer()
 
 @router.message(F.from_user.id.in_(admin_dialogues))
 async def admin_continue_dialog(message: Message):
     admin_id = message.from_user.id
+    
+    if message.text == "🔙 Возврат в меню":
+        admin_dialogues.pop(admin_id, None)
+        await message.answer("🛠 Возвращаемся в панель администратора:", reply_markup=admin_keyboard)
+        return
+
     appeal_id = admin_dialogues[admin_id]
 
     photo_id = message.photo[-1].file_id if message.photo else None
@@ -830,8 +834,10 @@ async def admin_continue_dialog(message: Message):
     cursor = conn.cursor()
     cursor.execute("SELECT user_id, status FROM appeals WHERE id = ?", (appeal_id,))
     row = cursor.fetchone()
+    
     if not row or row[1] == 'closed':
         await message.answer("⚠️ Тикет не найден или уже закрыт.")
+        admin_dialogues.pop(admin_id, None)
         conn.close()
         return
         
@@ -846,9 +852,9 @@ async def admin_continue_dialog(message: Message):
         reply_notify = f"📩 Ответ поддержки по тикету №{appeal_id}:\n\n{text}"
         if photo_id: await bot.send_photo(target_user_id, photo=photo_id, caption=reply_notify)
         else: await bot.send_message(target_user_id, reply_notify)
-        await message.answer("✅ Ответ доставлен сотруднику.")
+        await message.answer(f"✅ Ответ по тикету №{appeal_id} доставлен. Можете писать следующее сообщение.")
     except:
-        await message.answer("⚠️ Не удалось доставить сообщение.")
+        await message.answer("⚠️ Не удалось доставить сообщение пользователю.")
 
 @router.callback_query(F.data.startswith("close_appeal_"))
 async def admin_close_ticket_cb(callback: CallbackQuery):
@@ -921,7 +927,7 @@ async def show_filtered_appeals(callback: CallbackQuery):
         app_id, category, urgency, user_name, is_anon, created_at = app
         author = "🕵️‍♂️ Анонимно" if is_anon else f"👤 {user_name}"
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📜 История", callback_data=f"view_room_{app_id}")],
+            [InlineKeyboardButton(text="📜 История переписки", callback_data=f"view_room_{app_id}")],
             [InlineKeyboardButton(text="💬 Ответить", callback_data=f"open_chat_{app_id}")],
             [InlineKeyboardButton(text="🔒 Закрыть", callback_data=f"close_appeal_{app_id}")],
             [InlineKeyboardButton(text="🚫 Заблокировать юзера", callback_data=f"ban_user_{app_id}")]
@@ -949,7 +955,7 @@ async def view_room_history(callback: CallbackQuery):
     category, urgency, status, rating, created_at = app_info
     st_text = f"Закрыто (Оценка: {rating}/5)" if status == 'closed' and rating else ("Закрыто" if status == 'closed' else "Активно")
     
-    await callback.message.answer(f"📋 **Тикет №{appeal_id} [{urgency}]**\nКатегория: {category}\nСтатус: {st_text}\nСоздано: {created_at}\n-----------------------------------")
+    await callback.message.answer(f"📋 **История тикета №{appeal_id} [{urgency}]**\nКатегория: {category}\nСтатус: {st_text}\nСоздано: {created_at}\n-----------------------------------")
 
     for msg in messages:
         role, text, photo_id, dt = msg
