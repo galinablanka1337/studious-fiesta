@@ -102,21 +102,33 @@ async def cmd_start(message: Message):
     user_id = message.from_user.id
     
     # ПРИВЯЗКА КАРТИНОК ПО ВРЕМЕНИ
-    # Image.png - ночное, Image_2.png - вечер, Image_3.png - утро, Image_4.png - день
+    # image.png - ночь, image_2.png - вечер, image_3.png - утро, image_4.png - день
     if 5 <= hour < 12:
-        greeting, photo_file = "Доброе утро! ☀️", "image_3.png"
+        greeting = "Доброе утро! ☀️"
+        photo_file = "image_3.png"
     elif 12 <= hour < 17:
-        greeting, photo_file = "Добрый день! 🍏", "image_4.png"
+        greeting = "Добрый день! 🍏"
+        photo_file = "image_4.png"
     elif 17 <= hour < 23:
-        greeting, photo_file = "Добрый вечер! 🌆", "image_2.png"
+        greeting = "Добрый вечер! 🌆"
+        photo_file = "image_2.png"
     else:
-        greeting, photo_file = "Доброй ночи! 🌙", "image.png"
+        greeting = "Доброй ночи! 🌙"
+        photo_file = "image.png"
 
     admins = load_admins()
     if user_id in admins:
-        await message.answer_photo(photo=FSInputFile(photo_file), caption=f"{greeting} Панель администратора активна:", reply_markup=admin_keyboard)
+        await message.answer_photo(
+            photo=FSInputFile(photo_file), 
+            caption=f"{greeting} Панель администратора активна:", 
+            reply_markup=admin_keyboard
+        )
     else:
-        await message.answer_photo(photo=FSInputFile(photo_file), caption=f"{greeting} 👋 Твой личный помощник на связи.\n\n👇 Выберите нужный раздел:", reply_markup=employee_keyboard)
+        await message.answer_photo(
+            photo=FSInputFile(photo_file), 
+            caption=f"{greeting} 👋 Твой личный помощник на связи.\n\n👇 Выберите нужный раздел:", 
+            reply_markup=employee_keyboard
+        )
 
 @router.message(F.text == "🔙 В меню сотрудника")
 async def back_to_emp(message: Message):
@@ -153,31 +165,39 @@ async def get_appeal_text(message: Message):
 async def confirm_send_appeal(callback: CallbackQuery):
     user_id = callback.from_user.id
     data = pending_appeals.pop(user_id, None)
-    if not data: return
+    if not data: 
+        return
     
-    # Сохранение в БД
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO appeals (user_id, user_name, category, text, is_anon, created_at) VALUES (?,?,?,?,?,?)", 
-                   (user_id, callback.from_user.full_name, data["category"], data["text"], 1 if callback.data == "send_anon" else 0, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    cursor.execute(
+        "INSERT INTO appeals (user_id, user_name, category, text, is_anon, created_at) VALUES (?,?,?,?,?,?)", 
+        (user_id, callback.from_user.full_name, data["category"], data["text"], 1 if callback.data == "send_anon" else 0, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    )
     appeal_id = cursor.lastrowid
     conn.commit()
     conn.close()
 
-    # Уведомление админам
     for admin_id in load_admins():
-        try: await bot.send_message(admin_id, f"🚨 Новое обращение №{appeal_id}\n📂 {data['category']}\n{data['text']}")
-        except: pass
+        try: 
+            await bot.send_message(admin_id, f"🚨 Новое обращение №{appeal_id}\n📂 {data['category']}\n{data['text']}")
+        except: 
+            pass
 
     await callback.message.edit_text("✅ Обращение успешно отправлено!")
-    # БЛАГОДАРНОСТЬ
-    await callback.message.answer_photo(photo=FSInputFile("image_5.png"), caption="Спасибо, что вы с нами! Мы на связи и готовы ПОМОЧЬ 💚")
+    
+    # Благодарность сотруднику
+    await callback.message.answer_photo(
+        photo=FSInputFile("image_5.png"), 
+        caption="Спасибо, что вы с нами! Мы на связи и готовы ПОМОЧЬ 💚"
+    )
     await callback.answer()
 
-# --- ADMIN PANEL LOGIC (STATS, LIST, ETC) ---
+# --- ADMIN PANEL LOGIC ---
 @router.message(F.text == "📊 Статистика бота")
 async def admin_stats(message: Message):
-    if message.from_user.id not in load_admins(): return
+    if message.from_user.id not in load_admins(): 
+        return
     conn = sqlite3.connect("bot_database.db")
     count = conn.cursor().execute("SELECT COUNT(*) FROM appeals").fetchone()[0]
     conn.close()
@@ -214,4 +234,4 @@ async def main():
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(main()
+    asyncio.run(main())
