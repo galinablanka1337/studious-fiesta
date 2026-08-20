@@ -7,10 +7,6 @@ import csv
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
-from better_profanity import profanity
-
-# Загружаем словарь цензуры
-profanity.load_censor_words()
 
 TOKEN = os.getenv("BOT_TOKEN")
 ADMINS_FILE = "admins.txt"
@@ -82,25 +78,10 @@ def init_db():
             blocked_at TEXT
         )
     """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS broadcast_stats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            broadcast_id TEXT,
-            user_id INTEGER,
-            user_name TEXT,
-            created_at TEXT
-        )
-    """)
     conn.commit()
     conn.close()
 
 init_db()
-
-def contains_profanity(text: str) -> bool:
-    if not text:
-        return False
-    # Проверяем текст с помощью библиотеки better-profanity
-    return profanity.contains_profanity(text)
 
 def is_user_blocked(user_id: int) -> bool:
     conn = sqlite3.connect("bot_database.db")
@@ -175,8 +156,7 @@ admin_keyboard = ReplyKeyboardMarkup(
 manage_admins_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="➕ Добавить админа"), KeyboardButton(text="➖ Удалить админа")],
-        [KeyboardButton(text="📋 Список админов"), KeyboardButton(text="🚫 Черный список")],
-        [KeyboardButton(text="🔙 В панель администратора")]
+        [KeyboardButton(text="📋 Список админов"), KeyboardButton(text="🔙 В панель администратора")]
     ],
     resize_keyboard=True
 )
@@ -187,7 +167,7 @@ cancel_keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Во�
 
 async def auto_close_inactive_tickets():
     while True:
-        await asyncio.sleep(10800)
+        await asyncio.sleep(10800)  # Каждые 3 часа
         try:
             conn = sqlite3.connect("bot_database.db")
             cursor = conn.cursor()
@@ -285,21 +265,27 @@ async def cmd_start(message: Message):
         greeting, photo_file = "Доброй ночи! 🌙", "image.png"
 
     admins = load_admins()
-    if user_id in admins:
-        admin_welcome = (
-            f"{greeting}\n\n"
-            "🛠 Приветствую вас в панели управления!\n\n"
-            "👇 Выберите нужный раздел ниже:"
-        )
-        await message.answer_photo(photo=FSInputFile(photo_file), caption=admin_welcome, reply_markup=admin_keyboard)
-    else:
-        welcome_text = (
-            f"{greeting} 👋 Рады приветствовать вас!\n\n"
-            "🔒 Вы находитесь в **абсолютно анонимной и безопасной среде**. "
-            "Здесь вы можете открыто делиться своими мыслями, идеями или трудностями.\n\n"
-            "👇 Выберите нужный раздел в меню ниже:"
-        )
-        await message.answer_photo(photo=FSInputFile(photo_file), caption=welcome_text, reply_markup=employee_keyboard)
+    try:
+        if user_id in admins:
+            admin_welcome = (
+                f"{greeting}\n\n"
+                "🛠 Приветствую вас в панели управления!\n\n"
+                "👇 Выберите нужный раздел ниже:"
+            )
+            await message.answer_photo(photo=FSInputFile(photo_file), caption=admin_welcome, reply_markup=admin_keyboard)
+        else:
+            welcome_text = (
+                f"{greeting} 👋 Рады приветствовать вас!\n\n"
+                "🔒 Вы находитесь в **абсолютно анонимной и безопасной среде**. "
+                "Здесь вы можете открыто делиться своими мыслями, идеями или трудностями.\n\n"
+                "👇 Выберите нужный раздел в меню ниже:"
+            )
+            await message.answer_photo(photo=FSInputFile(photo_file), caption=welcome_text, reply_markup=employee_keyboard)
+    except:
+        if user_id in admins:
+            await message.answer(f"{greeting}\n\n🛠 Приветствую вас в панели управления!", reply_markup=admin_keyboard)
+        else:
+            await message.answer(f"{greeting} 👋 Рады приветствовать вас!", reply_markup=employee_keyboard)
 
 @router.message(F.text == "🔙 В панель администратора")
 async def back_to_admin(message: Message):
@@ -321,7 +307,7 @@ async def cancel_action(message: Message):
     else:
         await message.answer("🏠 Главное меню сотрудника:", reply_markup=employee_keyboard)
 
-# --- УПРАВЛЕНИЕ БЛОКИРОВКАМИ ---
+# --- УПРАВЛЕНИЕ БЛОКИРОВКАМИ (ЧЕРНЫЙ СПИСОК) ---
 
 @router.message(F.text == "🚫 Черный список")
 async def black_list_menu(message: Message):
@@ -585,16 +571,7 @@ async def execute_broadcast(message: Message):
     broadcast_process.remove(admin_id)
 
     photo_id = message.photo[-1].file_id if message.photo else None
-    raw_text = message.caption if message.photo and message.caption else message.text
-
-    broadcast_id = datetime.now().strftime("%Y%m%d%H%M%S")
-
-    broadcast_text = (
-        "📢 **ОФИЦИАЛЬНОЕ УВЕДОМЛЕНИЕ ОТ РУКОВОДСТВА** 📢\n"
-        "────────────────────────\n"
-        f"{raw_text}\n"
-        "────────────────────────"
-    )
+    text = message.caption if message.photo and message.caption else message.text
 
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
@@ -602,92 +579,17 @@ async def execute_broadcast(message: Message):
     users = cursor.fetchall()
     conn.close()
 
-    ack_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Ознакомлен(-а)", callback_data=f"ack_{broadcast_id}")]
-    ])
-
     success, failed = 0, 0
     for (u_id,) in users:
         if is_user_blocked(u_id): continue
         try:
-            if photo_id: 
-                await bot.send_photo(u_id, photo=photo_id, caption=broadcast_text, reply_markup=ack_keyboard)
-            else: 
-                await bot.send_message(u_id, broadcast_text, reply_markup=ack_keyboard)
+            if photo_id: await bot.send_photo(u_id, photo=photo_id, caption=text)
+            else: await bot.send_message(u_id, text)
             success += 1
         except:
             failed += 1
 
-    stats_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Посмотреть статистику прочтений", callback_data=f"stats_{broadcast_id}")]
-    ])
-
-    await message.answer(
-        f"📢 Рассылка успешно завершена!\n\n✅ Доставлено: {success}\n❌ Ошибок отправки: {failed}", 
-        reply_markup=admin_keyboard
-    )
-    await message.answer("📊 Вы можете отслеживать количество ознакомлений:", reply_markup=stats_kb)
-
-@router.callback_query(F.data.startswith("ack_"))
-async def acknowledge_broadcast(callback: CallbackQuery):
-    broadcast_id = callback.data.split("_")[1]
-    user_id = callback.from_user.id
-    user_name = callback.from_user.full_name
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    conn = sqlite3.connect("bot_database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM broadcast_stats WHERE broadcast_id = ? AND user_id = ?", (broadcast_id, user_id))
-    exists = cursor.fetchone()
-
-    if not exists:
-        cursor.execute(
-            "INSERT INTO broadcast_stats (broadcast_id, user_id, user_name, created_at) VALUES (?, ?, ?, ?)",
-            (broadcast_id, user_id, user_name, now_str)
-        )
-        conn.commit()
-    conn.close()
-
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except:
-        pass
-    
-    await callback.answer("✅ Спасибо, ваш статус «Ознакомлен(-а)» записан!", show_alert=False)
-
-@router.callback_query(F.data.startswith("stats_"))
-async def show_broadcast_stats(callback: CallbackQuery):
-    if callback.from_user.id not in load_admins(): return
-    broadcast_id = callback.data.split("_")[1]
-
-    conn = sqlite3.connect("bot_database.db")
-    cursor = conn.cursor()
-    total_users = cursor.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    cursor.execute("SELECT user_name, created_at FROM broadcast_stats WHERE broadcast_id = ?", (broadcast_id,))
-    reads = cursor.fetchall()
-    conn.close()
-
-    read_count = len(reads)
-    percent = int((read_count / total_users * 100)) if total_users > 0 else 0
-
-    text = (
-        f"📊 **Статистика прочтения рассылки**\n\n"
-        f"• Всего отправлено: {total_users} сотрудникам\n"
-        f"• Подтвердили («Ознакомлен»): **{read_count}** ({percent}%)\n\n"
-        f"👥 **Список прочитавших:**\n"
-    )
-
-    for idx, (u_name, dt) in enumerate(reads, 1):
-        text += f"{idx}. {u_name} — *{dt}*\n"
-        if len(text) > 3800:
-            text += "\n...и другие."
-            break
-
-    if not reads:
-        text += "Пока никто не нажал кнопку подтверждения."
-
-    await callback.message.answer(text)
-    await callback.answer()
+    await message.answer(f"📢 Рассылка завершена!\n✅ Успешно: {success}\n❌ Ошибок: {failed}", reply_markup=admin_keyboard)
 
 # --- ОПРОСЫ ---
 
@@ -746,16 +648,11 @@ async def select_category(message: Message):
 async def get_appeal_content(message: Message):
     user_id = message.from_user.id
     if is_user_blocked(user_id): return
+    cat_data = waiting_for_text.pop(user_id)
     
     photo_id = message.photo[-1].file_id if message.photo else None
     text = message.caption if message.photo and message.caption else (message.text if message.text else "Без текста")
     
-    # ПРОВЕРКА НА МАТ В ТЕКСТЕ ОБРАЩЕНИЯ
-    if contains_profanity(text):
-        await message.answer("⚠️ **Внимание:** В вашем сообщении обнаружена нецензурная лексика. Пожалуйста, переформулируйте текст без использования мата.")
-        return
-
-    cat_data = waiting_for_text.pop(user_id)
     pending_appeals[user_id] = {"category": cat_data["category"], "text": text, "photo_id": photo_id}
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -877,11 +774,6 @@ async def employee_continue_dialog(message: Message):
 
     photo_id = message.photo[-1].file_id if message.photo else None
     text = message.caption if message.photo and message.caption else (message.text if message.text else "Без текста")
-    
-    # ПРОВЕРКА НА МАТ В ДИАЛОГЕ СОТРУДНИКА
-    if contains_profanity(text):
-        await message.answer("⚠️ **Внимание:** В вашем сообщении обнаружена нецензурная лексика. Пожалуйста, отправьте сообщение без мата.")
-        return
         
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = sqlite3.connect("bot_database.db")
@@ -930,35 +822,6 @@ async def admin_open_chat(callback: CallbackQuery):
     await callback.message.answer(f"✍️ Режим диалога по тикету №{appeal_id}. Пишите ответы сотруднику (сколько угодно сообщений). Для выхода нажмите кнопку ниже:", reply_markup=cancel_keyboard)
     await callback.answer()
 
-@router.callback_query(F.data.startswith("emp_chat_"))
-async def employee_open_chat_cb(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if is_user_blocked(user_id): return
-    appeal_id = int(callback.data.split("_")[2])
-    
-    conn = sqlite3.connect("bot_database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT status FROM appeals WHERE id = ?", (appeal_id,))
-    row = cursor.fetchone()
-    conn.close()
-
-    if not row or row[0] == 'closed':
-        await callback.answer("❌ Этот тикет уже закрыт.", show_alert=True)
-        return
-
-    active_dialogues[user_id] = appeal_id
-    
-    employee_active_kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="✅ Вопрос решен (Закрыть тикет)")],
-            [KeyboardButton(text="🔙 Возврат в меню")]
-        ],
-        resize_keyboard=True
-    )
-    
-    await callback.message.answer(f"✍️ Режим диалога по тикету №{appeal_id} активирован. Пишите ответ поддержки ниже:", reply_markup=employee_active_kb)
-    await callback.answer()
-
 @router.message(F.from_user.id.in_(admin_dialogues))
 async def admin_continue_dialog(message: Message):
     admin_id = message.from_user.id
@@ -993,15 +856,8 @@ async def admin_continue_dialog(message: Message):
 
     try:
         reply_notify = f"📩 Ответ поддержки по тикету №{appeal_id}:\n\n{text}"
-        employee_inline_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💬 Ответить", callback_data=f"emp_chat_{appeal_id}")]
-        ])
-        
-        if photo_id: 
-            await bot.send_photo(target_user_id, photo=photo_id, caption=reply_notify, reply_markup=employee_inline_kb)
-        else: 
-            await bot.send_message(target_user_id, reply_notify, reply_markup=employee_inline_kb)
-            
+        if photo_id: await bot.send_photo(target_user_id, photo=photo_id, caption=reply_notify)
+        else: await bot.send_message(target_user_id, reply_notify)
         await message.answer(f"✅ Ответ по тикету №{appeal_id} доставлен. Можете писать следующее сообщение.")
     except:
         await message.answer("⚠️ Не удалось доставить сообщение пользователю.")
