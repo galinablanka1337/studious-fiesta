@@ -118,8 +118,9 @@ async def cmd_start(message: Message):
     admins = load_admins()
     if user_id in admins:
         try:
+            # ИСПОЛЬЗУЕМ ВАШ ИМЕННО image.png ДЛЯ АДМИНА
             await message.answer_photo(
-                photo=FSInputFile("image_1.png"),
+                photo=FSInputFile("image.png"),
                 caption=f"{greeting} Панель администратора активна:",
                 reply_markup=admin_keyboard
             )
