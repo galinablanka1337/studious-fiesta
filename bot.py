@@ -5,7 +5,6 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 
-# ЗАМЕНИ ЭТУ СТРОКУ НА СВОЙ ТОКЕН БОТА ОТ @BotFather
 TOKEN = "8998590593:AAFPr0DySSlO1BYOJRFR8fazQ_36TUbvFD8"
 
 bot = Bot(token=TOKEN)
