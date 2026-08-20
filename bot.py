@@ -5,7 +5,7 @@ import os
 import sqlite3
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, BotCommand
 
 # --- CONFIG ---
 TOKEN = os.getenv("BOT_TOKEN")
@@ -41,7 +41,7 @@ def init_db():
 
 init_db()
 
-# --- ADMINS ---
+# --- ADMINскай СОХРАНИТЕЛЬ ---
 def load_admins():
     admins = {SUPER_ADMIN_ID}
     if os.path.exists(ADMINS_FILE):
@@ -57,10 +57,10 @@ def save_admins(admins):
             f.write(f"{admin_id}\n")
 
 # --- STATES ---
-waiting_for_text = {}       # {user_id: {"category": str}}
-pending_appeals = {}         # {user_id: {"category": str, "text": str}}
-admin_reply_states = {}      # {admin_id: appeal_id}
-pending_admin_replies = {}   # {admin_id: {"appeal_id": int, "target_user_id": int, "msg": Message}}
+waiting_for_text = {}       
+pending_appeals = {}         
+admin_reply_states = {}      
+pending_admin_replies = {}   
 adding_admin_process = set()
 removing_admin_process = set()
 
@@ -96,6 +96,13 @@ cancel_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+# --- УСТАНОВКА КНОПКИ МЕНЮ В ТЕЛЕГРАМЕ ---
+async def set_bot_commands(bot: Bot):
+    commands = [
+        BotCommand(command="start", description="🚀 Запустить бота / Главное меню")
+    ]
+    await bot.set_my_commands(commands)
+
 # --- HANDLERS: START ---
 @router.message(Command("start"))
 async def cmd_start(message: Message):
@@ -111,7 +118,7 @@ async def cmd_start(message: Message):
     if user_id in admins:
         await message.answer(f"{greeting} Панель администратора активна:", reply_markup=admin_keyboard)
     else:
-        await message.answer(f"{greeting} 👋 Твой личный помощник во ВкусВилле на связи. Выберите категорию обращения:", reply_markup=employee_keyboard)
+        await message.answer(f"{greeting} 👋 Твой личный помощник во ВкусВилле на связи.\n\n👇 Выберите нужный раздел или категорию обращения ниже:", reply_markup=employee_keyboard)
 
 @router.message(F.text == "🔙 В меню сотрудника")
 async def back_to_emp(message: Message):
@@ -279,7 +286,6 @@ async def close_appeal(callback: CallbackQuery):
 async def noop(callback: CallbackQuery):
     await callback.answer("Обращение уже обрабатывается.", show_alert=True)
 
-# Шаг 1: Админ присылает ответ, бот запрашивает подтверждение
 @router.message(F.from_user.id.in_(admin_reply_states))
 async def admin_prepare_reply(message: Message):
     admin_id = message.from_user.id
@@ -300,7 +306,6 @@ async def admin_prepare_reply(message: Message):
 
     await message.answer("⚠️ **Проверьте ваш ответ перед отправкой:**\nЭто сообщение увидит сотрудник.", reply_markup=confirm_kb, parse_mode="Markdown")
 
-# Шаг 2: Обработка кнопок подтверждения от админа
 @router.callback_query(F.data.in_({"confirm_admin_reply", "cancel_admin_reply"}))
 async def admin_reply_confirmation(callback: CallbackQuery):
     admin_id = callback.from_user.id
@@ -433,11 +438,18 @@ async def process_admin_mutations(message: Message):
             await message.answer("❌ Ошибка. ID должен состоять только из цифр.", reply_markup=manage_admins_keyboard)
         return
 
+# --- ЛОВУШКА ДЛЯ ПУСТОГО ДИАЛОГА (ЕСЛИ НАПИСАЛИ ЛЮБОЙ ТЕКСТ ВМЕСТО СТАРТА) ---
+@router.message()
+async def catch_all_messages(message: Message):
+    # Если пользователь написал что-то случайное в пустом чате, запускаем приветствие
+    await cmd_start(message)
+
 # --- MAIN RUN ---
 async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    print("🤖 Бот с защитой отправки ответов успешно запущен!")
+    await set_bot_commands(bot) # Устанавливаем кнопку Меню в Telegram
+    print("🤖 Бот с кнопкой меню и авто-стартом успешно запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
