@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import sqlite3
+from collections import defaultdict
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, BotCommand
@@ -41,7 +42,7 @@ def init_db():
 
 init_db()
 
-# --- ADMINскай СОХРАНИТЕЛЬ ---
+# --- ADMINS ---
 def load_admins():
     admins = {SUPER_ADMIN_ID}
     if os.path.exists(ADMINS_FILE):
@@ -77,8 +78,9 @@ employee_keyboard = ReplyKeyboardMarkup(
 
 admin_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📊 Статистика бота"), KeyboardButton(text="📁 Обращения за месяц")],
-        [KeyboardButton(text="👥 Управление админами"), KeyboardButton(text="🔙 В меню сотрудника")]
+        [KeyboardButton(text="📁 Актуальные обращения"), KeyboardButton(text="📊 Статистика бота")],
+        [KeyboardButton(text="📁 Обращения за месяц"), KeyboardButton(text="👥 Управление админами")],
+        [KeyboardButton(text="🔙 В меню сотрудника")]
     ],
     resize_keyboard=True
 )
@@ -96,10 +98,9 @@ cancel_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# --- УСТАНОВКА КНОПКИ МЕНЮ В ТЕЛЕГРАМЕ ---
 async def set_bot_commands(bot: Bot):
     commands = [
-        BotCommand(command="start", description="🚀 Запустить бота / Главное меню")
+        BotCommand(command="start", description="🚀 Главное меню")
     ]
     await bot.set_my_commands(commands)
 
@@ -286,9 +287,25 @@ async def close_appeal(callback: CallbackQuery):
 async def noop(callback: CallbackQuery):
     await callback.answer("Обращение уже обрабатывается.", show_alert=True)
 
+# Защита от перехвата меню и подготовка ответа админа
 @router.message(F.from_user.id.in_(admin_reply_states))
 async def admin_prepare_reply(message: Message):
     admin_id = message.from_user.id
+    text = message.text
+
+    # Если админ нажал на любую кнопку админ-панели во время ввода ответа — сбрасываем режим ввода
+    admin_menu_buttons = {"📁 Актуальные обращения", "📊 Статистика бота", "📁 Обращения за месяц", "👥 Управление админами", "🔙 В меню сотрудника"}
+    if text in admin_menu_buttons:
+        admin_reply_states.pop(admin_id, None)
+        pending_admin_replies.pop(admin_id, None)
+        
+        if text == "📁 Актуальные обращения": await admin_active_appeals(message)
+        elif text == "📊 Статистика бота": await admin_stats(message)
+        elif text == "📁 Обращения за месяц": await admin_month_appeals(message)
+        elif text == "👥 Управление админами": await admin_manage_menu(message)
+        elif text == "🔙 В меню сотрудника": await back_to_emp(message)
+        return
+
     state = admin_reply_states.get(admin_id)
     if not state:
         return
@@ -340,6 +357,32 @@ async def admin_reply_confirmation(callback: CallbackQuery):
     await callback.answer()
 
 # --- ADMIN PANEL BUTTONS ---
+@router.message(F.text == "📁 Актуальные обращения")
+async def admin_active_appeals(message: Message):
+    if message.from_user.id not in load_admins(): return
+    
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, user_name, category, text, status, created_at, is_anon FROM appeals WHERE status != 'closed' ORDER BY id DESC")
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        await message.answer("📁 На данный момент нет активных обращений.")
+        return
+
+    grouped = defaultdict(list)
+    for r in rows:
+        grouped[r[2]].append(r)
+
+    for category, items in grouped.items():
+        text = f"📂 **Тема: {category}**\n"
+        for r in items:
+            status_str = "🆕 Новое" if r[4] == 'new' else "🟡 В работе"
+            author = "🕵️‍♂️ Анонимно" if r[6] == 1 else f"👤 {r[1]}"
+            text += f"\n• **ID №{r[0]}** | Статус: {status_str}\n  От: {author} | {r[5]}\n  💬 _{r[3]}_ \n"
+        await message.answer(text, parse_mode="Markdown")
+
 @router.message(F.text == "📊 Статистика бота")
 async def admin_stats(message: Message):
     if message.from_user.id not in load_admins(): return
@@ -438,18 +481,16 @@ async def process_admin_mutations(message: Message):
             await message.answer("❌ Ошибка. ID должен состоять только из цифр.", reply_markup=manage_admins_keyboard)
         return
 
-# --- ЛОВУШКА ДЛЯ ПУСТОГО ДИАЛОГА (ЕСЛИ НАПИСАЛИ ЛЮБОЙ ТЕКСТ ВМЕСТО СТАРТА) ---
 @router.message()
 async def catch_all_messages(message: Message):
-    # Если пользователь написал что-то случайное в пустом чате, запускаем приветствие
     await cmd_start(message)
 
 # --- MAIN RUN ---
 async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    await set_bot_commands(bot) # Устанавливаем кнопку Меню в Telegram
-    print("🤖 Бот с кнопкой меню и авто-стартом успешно запущен!")
+    await set_bot_commands(bot)
+    print("🤖 Бот успешно запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
