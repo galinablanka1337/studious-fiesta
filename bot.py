@@ -1,27 +1,48 @@
 from datetime import datetime
 import asyncio
 import logging
+import os
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 
-TOKEN = "8998590593:AAFPr0DySSlO1BYOJRFR8fazQ_36TUbvFD8"
+# --- CONFIGURATION ---
+# Токен подтягивается из защищенных переменных окружения хостинга BotHost
+TOKEN = os.getenv("BOT_TOKEN")
+ADMINS_FILE = "admins.txt"
+SUPER_ADMIN_ID = 762076580  # Твой главный ID
+
+if not TOKEN:
+    raise ValueError("❌ Ошибка: Не найден BOT_TOKEN в переменных окружения хостинга!")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# Список ID администраторов (лидеров)
-ADMIN_IDS = [762076580, 987654321] 
+# --- PERSISTENT ADMIN STORAGE ---
+def load_admins():
+    if not os.path.exists(ADMINS_FILE):
+        return {SUPER_ADMIN_ID}
+    with open(ADMINS_FILE, "r") as f:
+        return {int(line.strip()) for line in f if line.strip().isdigit()}
 
-# Имена твоих картинок в папке с ботом
-IMG_NIGHT = "image.png"     # Доброй ночи
-IMG_EVENING = "image_2.png" # Добрый вечер
-IMG_MORNING = "image_3.png" # Доброе утро
-IMG_DAY = "image_4.png"     # Добрый день
-IMG_THANKS = "image_5.png"  # Спасибо за ваше обращение
+def save_admins(admins):
+    with open(ADMINS_FILE, "w") as f:
+        for admin_id in admins:
+            f.write(f"{admin_id}\n")
 
-# Обычное меню для сотрудника
+# --- STATES ---
+adding_admin_process = set()
+removing_admin_process = set()
+
+# --- IMAGES ---
+IMG_NIGHT = "image.png"     
+IMG_EVENING = "image_2.png" 
+IMG_MORNING = "image_3.png" 
+IMG_DAY = "image_4.png"     
+IMG_THANKS = "image_5.png"  
+
+# --- KEYBOARDS ---
 employee_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🌴 Отпуска"), KeyboardButton(text="🏥 Больничные")],
@@ -31,170 +52,131 @@ employee_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# Специальное меню для администратора
 admin_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Статистика бота"), KeyboardButton(text="📁 Актуальные обращения")],
-        [KeyboardButton(text="📈 Отчеты по дисциплине"), KeyboardButton(text="🔙 В обычное меню")]
+        [KeyboardButton(text="👥 Управление админами"), KeyboardButton(text="📈 Отчеты по дисциплине")],
+        [KeyboardButton(text="🔙 В обычное меню")]
     ],
     resize_keyboard=True
 )
 
-# Тексты базы знаний
-VACATION_TEXT = (
-    "🌴 **Информация по отпускам:**\n\n"
-    "• **Остаток дней:** Можно узнать через ТехБота, отправив слово «отпуск», или через отдел кадров.\n"
-    "• **Оформление:** Заявление и предупреждение лидера/коллег подаются за **2 недели** до начала.\n"
-    "• **Периодичность:** Первый отпуск доступен через **6 месяцев** работы. Стандартный отпуск — 28 календарных дней, его можно делить (одна часть не менее 14 дней).\n"
-    "• **Контакты кадров:**\n"
-    "  - Москва и МО: `kadri@izbenka.msk.ru`\n"
-    "  - Санкт-Петербург: `kdpspb@vkusvill.ru`\n"
-    "  - Регионы: `region@vkusvill.ru`"
+manage_admins_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="➕ Добавить админа"), KeyboardButton(text="➖ Удалить админа")],
+        [KeyboardButton(text="📋 Список админов"), KeyboardButton(text="🔙 Назад в админ-панель")]
+    ],
+    resize_keyboard=True
 )
 
-SICK_LEAVE_TEXT = (
-    "🏥 **Порядок по больничным листам:**\n\n"
-    "• После закрытия больничного отправьте его номер на электронную почту отдела кадров вашего региона. Данные обрабатываются 3 календарных дня.\n"
-    "• **Выплаты:** Первые 3 дня оплачивает работодатель (в ближайший день выплаты зарплаты 10 или 25 числа), остальные дни — СФР в течение 10 рабочих дней."
-)
+# --- TEXTS ---
+VACATION_TEXT = "🌴 **Информация по отпускам:**\n\n• Заявление подается за 2 недели до начала."
+SICK_LEAVE_TEXT = "🏥 **Порядок по больничным листам:**\n\n• После закрытия больничного отправьте его номер в отдел кадров."
+SCHEDULE_TEXT = "⏱️ **График и рабочее время:**\n\n• Используется приложение «Работа со Вкусом»."
+DUTIES_TEXT = "📋 **Основные обязанности:**\n\n• Сбор заказов, контроль сроков годности."
+DISCIPLINE_TEXT = "⚠️ **Дисциплина:**\n\n• Своевременно предоставляйте оправдательные документы."
 
-SCHEDULE_TEXT = (
-    "⏱️ **График и рабочее время:**\n\n"
-    "• **Планирование:** Используется мобильное приложение «Работа со Вкусом» (`ally.software`).\n"
-    "• **Обед:** Перерыв на отдых и питание составляет от 30 минут до 2 часов (в рабочее время не входит).\n"
-    "• **Обогрев:** Работникам на открытом воздухе, в необогреваемых помещениях или грузчикам предоставляются оплачиваемые перерывы для обогрева (два по 10 минут при 8-часовой смене)."
-)
-
-DUTIES_TEXT = (
-    "📋 **Основные обязанности кассира-комплектовщика:**\n\n"
-    "• Сбор заказов с учетом комментариев покупателей, согласование замен.\n"
-    "• Контроль сроков годности, ротации, товарного соседства и работы с браком.\n"
-    "• Участие в приемке товара (по качеству и количеству в 1С), погрузочно-разгрузочные работы.\n"
-    "• Поддержание чистоты и порядка.\n"
-    "• **Важно:** Запрещено использовать телефон в личных целях при сборке, курить вне отведенных мест, а также списывать или уценивать качественный товар с остатком более суток."
-)
-
-DISCIPLINE_TEXT = (
-    "⚠️ **Дисциплина и отсутствие на рабочем месте:**\n\n"
-    "• При отсутствии по уважительной причине нужно предоставить оправдательные документы в течение 2 рабочих дней после выхода.\n"
-    "• При прогуле старший сотрудник фиксирует неявку в системе Ally, запрашивает письменное объяснение (дает 2 рабочих дня) и передает акты в отдел кадров.\n"
-    "• Если сотрудник не выходит на связь 3 рабочих дня, документы направляются в кадры для увольнения."
-)
-
-# Приветствие по времени суток с картинками
+# --- HANDLERS ---
 @router.message(Command("start"))
 async def cmd_start(message: Message):
-    hour = datetime.now().hour
     user_id = message.from_user.id
+    hour = datetime.now().hour
     
-    if 5 <= hour < 12:
-        greeting = "Доброе утро! ☀️"
-        photo_path = IMG_MORNING
-    elif 12 <= hour < 17:
-        greeting = "Добрый день! 🍏"
-        photo_path = IMG_DAY
-    elif 17 <= hour < 23:
-        greeting = "Добрый вечер! 🌆"
-        photo_path = IMG_EVENING
+    if 5 <= hour < 12: greeting = "Доброе утро! ☀️"
+    elif 12 <= hour < 17: greeting = "Добрый день! 🍏"
+    elif 17 <= hour < 23: greeting = "Добрый вечер! 🌆"
+    else: greeting = "Доброй ночи! 🌙"
+
+    if user_id in load_admins():
+        await message.answer(f"{greeting} Приветствую, Администратор! 👑", reply_markup=admin_keyboard)
     else:
-        greeting = "Доброй ночи! 🌙"
-        photo_path = IMG_NIGHT
+        try:
+            await message.answer_photo(photo=FSInputFile(IMG_MORNING), caption=f"{greeting} 👋 Твой помощник на связи.", reply_markup=employee_keyboard)
+        except:
+            await message.answer(f"{greeting} 👋 Твой помощник на связи.", reply_markup=employee_keyboard)
 
-    if user_id in ADMIN_IDS:
-        text = (
-            f"{greeting} Приветствую, Администратор! 👑\n"
-            "Панель управления активирована. Выберите нужный раздел отчетов и статистики ниже:"
-        )
-        keyboard = admin_keyboard
-    else:
-        text = (
-            f"{greeting} Привет-привет! 👋 Твой личный помощник во ВкусВилле на связи.\n"
-            "Выбирай нужную тему в меню или просто напиши свой вопрос текстом!"
-        )
-        keyboard = employee_keyboard
-
+async def send_response(message: Message, text: str):
     try:
-        photo = FSInputFile(photo_path)
-        await message.answer_photo(photo=photo, caption=text, reply_markup=keyboard)
-    except Exception:
-        await message.answer(text, reply_markup=keyboard)
-
-
-# Функция отправки ответа с картинкой-благодарностью
-async def send_response_with_thanks(message: Message, text: str):
-    try:
-        photo = FSInputFile(IMG_THANKS)
-        await message.answer_photo(photo=photo, caption=text, parse_mode="Markdown")
-    except Exception:
+        await message.answer_photo(photo=FSInputFile(IMG_THANKS), caption=text, parse_mode="Markdown")
+    except:
         await message.answer(text, parse_mode="Markdown")
 
+@router.message(F.text == "👥 Управление админами")
+async def admin_manage_menu(message: Message):
+    if message.from_user.id in load_admins():
+        await message.answer("👥 Меню управления администраторами:", reply_markup=manage_admins_keyboard)
 
-# Кнопки администратора
-@router.message(F.text == "📊 Статистика бота")
-async def admin_stats(message: Message):
-    if message.from_user.id in ADMIN_IDS:
-        await message.answer("📊 **Статистика бота:**\n\n• Всего запросов за сегодня: 42\n• Самый популярный раздел: Отпуска\n• Активных пользователей: 18", parse_mode="Markdown")
+@router.message(F.text == "📋 Список админов")
+async def list_admins(message: Message):
+    if message.from_user.id in load_admins():
+        admins = load_admins()
+        await message.answer(f"📋 **Администраторы:**\n" + "\n".join([f"• `{aid}`" for aid in admins]), parse_mode="Markdown")
 
-@router.message(F.text == "📁 Актуальные обращения")
-async def admin_requests(message: Message):
-    if message.from_user.id in ADMIN_IDS:
-        await message.answer("📁 **Актуальные обращения:**\n\n1. Смена графика (Даркстор Центр) — ожидает ответа\n2. Вопрос по больничному (Иванов И.) — передано в кадры", parse_mode="Markdown")
+@router.message(F.text == "➕ Добавить админа")
+async def ask_add_admin(message: Message):
+    if message.from_user.id in load_admins():
+        adding_admin_process.add(message.from_user.id)
+        await message.answer("✍️ Отправьте ID нового администратора (только цифры):")
 
-@router.message(F.text == "📈 Отчеты по дисциплине")
-async def admin_discipline_reports(message: Message):
-    if message.from_user.id in ADMIN_IDS:
-        await message.answer("📈 **Отчеты по дисциплине:**\n\n• Прогулов за текущую неделю: 0\n• Все акты по опозданиям закрыты.", parse_mode="Markdown")
+@router.message(F.text == "➖ Удалить админа")
+async def ask_remove_admin(message: Message):
+    if message.from_user.id in load_admins():
+        removing_admin_process.add(message.from_user.id)
+        await message.answer("✍️ Отправьте ID администратора для удаления:")
 
-@router.message(F.text == "🔙 В обычное меню")
-async def back_to_employee(message: Message):
-    await message.answer("Переключаюсь в стандартное меню сотрудника:", reply_markup=employee_keyboard)
-
-
-# Кнопки сотрудника
-@router.message(F.text == "🌴 Отпуска")
-async def btn_vacations(message: Message):
-    await send_response_with_thanks(message, VACATION_TEXT)
-
-@router.message(F.text == "🏥 Больничные")
-async def btn_sick(message: Message):
-    await send_response_with_thanks(message, SICK_LEAVE_TEXT)
-
-@router.message(F.text == "⏱️ Графики и перерывы")
-async def btn_schedule(message: Message):
-    await send_response_with_thanks(message, SCHEDULE_TEXT)
-
-@router.message(F.text == "📋 Обязанности кассира")
-async def btn_duties(message: Message):
-    await send_response_with_thanks(message, DUTIES_TEXT)
-
-@router.message(F.text == "⚠️ Дисциплина и прогулы")
-async def btn_discipline(message: Message):
-    await send_response_with_thanks(message, DISCIPLINE_TEXT)
-
-
-# Умный поиск по ключевым словам
 @router.message(F.text)
-async def smart_search(message: Message):
-    text_lower = message.text.lower()
+async def process_text(message: Message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    admins = load_admins()
+
+    # --- ADMIN INPUT LOGIC ---
+    if user_id in adding_admin_process:
+        adding_admin_process.remove(user_id)
+        if text.isdigit():
+            admins.add(int(text))
+            save_admins(admins)
+            await message.answer(f"✅ ID {text} успешно добавлен в администраторы!", reply_markup=manage_admins_keyboard)
+        else:
+            await message.answer("❌ Ошибка. ID должен состоять только из цифр.", reply_markup=manage_admins_keyboard)
+        return
     
-    if any(word in text_lower for word in ["отпуск", "отпуска", "отгул", "дней"]):
-        await send_response_with_thanks(message, VACATION_TEXT)
-    elif any(word in text_lower for word in ["больничный", "больничным", "болею", "сфр"]):
-        await send_response_with_thanks(message, SICK_LEAVE_TEXT)
-    elif any(word in text_lower for word in ["график", "обед", "перерыв", "время", "обогрев", "ally"]):
-        await send_response_with_thanks(message, SCHEDULE_TEXT)
-    elif any(word in text_lower for word in ["обязанности", "сбор", "заказ", "брак", "срок", "товар"]):
-        await send_response_with_thanks(message, DUTIES_TEXT)
-    elif any(word in text_lower for word in ["прогул", "дисциплина", "опоздал", "увольнение", "отсутствие"]):
-        await send_response_with_thanks(message, DISCIPLINE_TEXT)
+    if user_id in removing_admin_process:
+        removing_admin_process.remove(user_id)
+        if text.isdigit():
+            rem_id = int(text)
+            if rem_id == SUPER_ADMIN_ID:
+                await message.answer("❌ Нельзя удалить главного суперадмина!", reply_markup=manage_admins_keyboard)
+            elif rem_id in admins:
+                admins.remove(rem_id)
+                save_admins(admins)
+                await message.answer(f"🗑️ ID {rem_id} удален из администраторов.", reply_markup=manage_admins_keyboard)
+            else:
+                await message.answer("⚠️ Такого ID нет в списке админов.", reply_markup=manage_admins_keyboard)
+        else:
+            await message.answer("❌ Ошибка. ID должен состоять только из цифр.", reply_markup=manage_admins_keyboard)
+        return
+
+    # --- ADMIN ACTIONS ---
+    if user_id in admins:
+        if text == "🔙 Назад в админ-панель": await message.answer("Админ-панель:", reply_markup=admin_keyboard)
+        elif text == "🔙 В обычное меню": await message.answer("Меню сотрудника:", reply_markup=employee_keyboard)
+        elif text == "📊 Статистика бота": await message.answer("📊 Статистика: запросов за сегодня — 12")
+        elif text == "📁 Актуальные обращения": await message.answer("📁 Активных обращений нет.")
+        elif text == "📈 Отчеты по дисциплине": await message.answer("📈 Нарушений дисциплины не зафиксировано.")
+        else: await search_logic(message)
     else:
-        await message.answer(
-            "Хм, я не совсем понял запрос 🤔 Воспользуйся кнопками меню или напиши ключевое слово (например: «отпуск», «больничный», «график»).",
-            reply_markup=employee_keyboard
-        )
+        await search_logic(message)
 
+async def search_logic(message: Message):
+    text_lower = message.text.lower()
+    if "отпуск" in text_lower: await send_response(message, VACATION_TEXT)
+    elif "больнич" in text_lower: await send_response(message, SICK_LEAVE_TEXT)
+    elif "график" in text_lower or "перерыв" in text_lower: await send_response(message, SCHEDULE_TEXT)
+    elif "обязанности" in text_lower: await send_response(message, DUTIES_TEXT)
+    elif "прогул" in text_lower or "дисциплин" in text_lower: await send_response(message, DISCIPLINES_TEXT if 'DISCIPLINES_TEXT' in globals() else DISCIPLINE_TEXT)
+    else: await message.answer("Я вас не совсем понял, воспользуйтесь кнопками меню 👇", reply_markup=employee_keyboard)
 
-# Главная функция запуска бота
 async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
