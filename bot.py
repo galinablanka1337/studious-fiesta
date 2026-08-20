@@ -28,6 +28,7 @@ def init_db():
             user_name TEXT,
             category TEXT,
             text TEXT,
+            photo_id TEXT,
             is_anon INTEGER,
             status TEXT DEFAULT 'new',
             admin_id INTEGER,
@@ -56,6 +57,7 @@ def save_admins(admins):
 waiting_for_text = {}
 pending_appeals = {}
 admin_reply_states = {}
+pending_admin_confirm = {}
 adding_admin_process = set()
 removing_admin_process = set()
 
@@ -126,6 +128,7 @@ async def cancel_action(message: Message):
     user_id = message.from_user.id
     waiting_for_text.pop(user_id, None)
     admin_reply_states.pop(user_id, None)
+    pending_admin_confirm.pop(user_id, None)
     adding_admin_process.discard(user_id)
     removing_admin_process.discard(user_id)
     
@@ -137,18 +140,56 @@ async def cancel_action(message: Message):
 @router.message(F.text.in_(["✍️ Анонимное обращение", "💡 Новые идеи", "⚠️ Жалобы", "⚔️ Конфликт", "🤝 Помощь сотруднику", "💬 Другие вопросы", "🌴 Отпуска", "🏥 Больничные"]))
 async def select_category(message: Message):
     waiting_for_text[message.from_user.id] = {"category": message.text}
-    await message.answer(f"✍️ Вы выбрали: {message.text}\nНапишите ваш вопрос одним сообщением:", reply_markup=cancel_keyboard)
+    await message.answer(f"✍️ Вы выбрали: {message.text}\nНапишите ваш вопрос (можно прикрепить фото):", reply_markup=cancel_keyboard)
 
-@router.message(F.text & F.from_user.id.in_(waiting_for_text))
-async def get_appeal_text(message: Message):
+# Обработка текста или фото от сотрудника
+@router.message((F.text | F.photo) & F.from_user.id.in_(waiting_for_text))
+async def get_appeal_content(message: Message):
     user_id = message.from_user.id
     cat_data = waiting_for_text.pop(user_id)
-    pending_appeals[user_id] = {"category": cat_data["category"], "text": message.text}
+    
+    text = message.caption if message.photo else message.text
+    if not text:
+        text = "Без текста (только фото)"
+        
+    photo_id = message.photo[-1].file_id if message.photo else None
+    
+    pending_appeals[user_id] = {
+        "category": cat_data["category"], 
+        "text": text, 
+        "photo_id": photo_id
+    }
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтвердить и отправить", callback_data="proceed_send")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_send")]
+    ])
+    
+    if photo_id:
+        await message.answer_photo(photo=photo_id, caption=f"📄 Категория: {cat_data['category']}\nТекст: {text}\n\nВсё верно? Отправляем?", reply_markup=kb)
+    else:
+        await message.answer(f"📄 Категория: {cat_data['category']}\nТекст: {text}\n\nВсё верно? Отправляем?", reply_markup=kb)
+
+@router.callback_query(F.data == "cancel_send")
+async def cancel_send_callback(callback: CallbackQuery):
+    pending_appeals.pop(callback.from_user.id, None)
+    await callback.message.edit_text("❌ Отправка отменена.")
+    await callback.message.answer("Главное меню:", reply_markup=employee_keyboard)
+    await callback.answer()
+
+@router.callback_query(F.data == "proceed_send")
+async def ask_anonymity_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id not in pending_appeals:
+        await callback.answer("Данные устарели, начните заново.", show_alert=True)
+        return
+        
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🕵️‍♂️ Анонимно", callback_data="send_anon")],
         [InlineKeyboardButton(text="👤 С именем", callback_data="send_named")]
     ])
-    await message.answer("📄 Проверьте текст обращения и выберите способ отправки:", reply_markup=kb)
+    await callback.message.edit_text("Выберите способ отправки обращения:", reply_markup=kb)
+    await callback.answer()
 
 @router.callback_query(F.data.in_({"send_anon", "send_named"}))
 async def confirm_send_appeal(callback: CallbackQuery):
@@ -160,8 +201,8 @@ async def confirm_send_appeal(callback: CallbackQuery):
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO appeals (user_id, user_name, category, text, is_anon, created_at) VALUES (?,?,?,?,?,?)", 
-        (user_id, callback.from_user.full_name, data["category"], data["text"], 1 if callback.data == "send_anon" else 0, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        "INSERT INTO appeals (user_id, user_name, category, text, photo_id, is_anon, created_at) VALUES (?,?,?,?,?,?,?)", 
+        (user_id, callback.from_user.full_name, data["category"], data["text"], data["photo_id"], 1 if callback.data == "send_anon" else 0, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     )
     appeal_id = cursor.lastrowid
     conn.commit()
@@ -174,11 +215,11 @@ async def confirm_send_appeal(callback: CallbackQuery):
     author_info = "🕵️‍♂️ Анонимный сотрудник" if callback.data == "send_anon" else f"👤 {callback.from_user.full_name}"
     for admin_id in load_admins():
         try: 
-            await bot.send_message(
-                admin_id, 
-                f"🚨 Новое обращение №{appeal_id}\n📂 Категория: {data['category']}\nОт: {author_info}\n\n💬 Текст:\n{data['text']}", 
-                reply_markup=admin_kb
-            )
+            msg_text = f"🚨 Новое обращение №{appeal_id}\n📂 Категория: {data['category']}\nОт: {author_info}\n\n💬 Текст:\n{data['text']}"
+            if data["photo_id"]:
+                await bot.send_photo(admin_id, photo=data["photo_id"], caption=msg_text, reply_markup=admin_kb)
+            else:
+                await bot.send_message(admin_id, msg_text, reply_markup=admin_kb)
         except: 
             pass
 
@@ -186,48 +227,96 @@ async def confirm_send_appeal(callback: CallbackQuery):
     await callback.message.answer_photo(photo=FSInputFile("image_5.png"), caption="Спасибо, что вы с нами! Мы на связи и готовы ПОМОЧЬ 💚")
     await callback.answer()
 
+# --- ЛОГИКА ОТВЕТОВ АДМИНА С ПОДТВЕРЖДЕНИЕМ И ФОТО ---
 @router.callback_query(F.data.startswith("reply_appeal_"))
 async def start_admin_reply(callback: CallbackQuery):
     if callback.from_user.id not in load_admins():
         await callback.answer("У вас нет прав администратора.", show_alert=True)
         return
     
-    appeal_id = callback.data.split("_")[2]
-    admin_reply_states[callback.from_user.id] = int(appeal_id)
+    appeal_id = int(callback.data.split("_")[2])
+    admin_reply_states[callback.from_user.id] = appeal_id
     
-    await callback.message.answer(f"✍️ Введите ответ на обращение №{appeal_id} (он будет отправлен сотруднику):", reply_markup=cancel_keyboard)
+    await callback.message.answer(f"✍️ Введите ответ на обращение №{appeal_id} (можно прикрепить фото):", reply_markup=cancel_keyboard)
     await callback.answer()
 
-@router.message(F.text & F.from_user.id.in_(admin_reply_states))
-async def send_admin_reply_to_user(message: Message):
+@router.message((F.text | F.photo) & F.from_user.id.in_(admin_reply_states))
+async def get_admin_reply_content(message: Message):
     admin_id = message.from_user.id
     appeal_id = admin_reply_states.pop(admin_id)
-    reply_text = message.text
+    
+    text = message.caption if message.photo else message.text
+    photo_id = message.photo[-1].file_id if message.photo else None
+    
+    pending_admin_confirm[admin_id] = {
+        "appeal_id": appeal_id,
+        "text": text,
+        "photo_id": photo_id
+    }
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Отправить ответ сотруднику", callback_data="confirm_admin_reply")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_admin_reply")]
+    ])
+    
+    preview_msg = f"📤 Проверьте ответ на обращение №{appeal_id}:\n\n{text}"
+    if photo_id:
+        await message.answer_photo(photo=photo_id, caption=preview_msg, reply_markup=kb)
+    else:
+        await message.answer(preview_msg, reply_markup=kb)
+
+@router.callback_query(F.data == "cancel_admin_reply")
+async def cancel_admin_reply_cb(callback: CallbackQuery):
+    pending_admin_confirm.pop(callback.from_user.id, None)
+    await callback.message.edit_text("❌ Отправка ответа отменена.")
+    await callback.message.answer("Админ-панель:", reply_markup=admin_keyboard)
+    await callback.answer()
+
+@router.callback_query(F.data == "confirm_admin_reply")
+async def execute_admin_reply(callback: CallbackQuery):
+    admin_id = callback.from_user.id
+    data = pending_admin_confirm.pop(admin_id, None)
+    if not data:
+        await callback.answer("Данные устарели.", show_alert=True)
+        return
+        
+    appeal_id = data["appeal_id"]
+    reply_text = data["text"]
+    photo_id = data["photo_id"]
 
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     cursor.execute("SELECT user_id, category FROM appeals WHERE id = ?", (appeal_id,))
     row = cursor.fetchone()
+    
     if row:
         target_user_id, category = row
         cursor.execute("UPDATE appeals SET status = 'closed', admin_id = ? WHERE id = ?", (admin_id, appeal_id))
         conn.commit()
         
         try:
-            await bot.send_message(target_user_id, f"📩 Получен ответ от администратора по вашему обращению №{appeal_id} ({category}):\n\n{reply_text}")
-            await message.answer("✅ Ответ успешно отправлен сотруднику!", reply_markup=admin_keyboard)
+            full_reply = f"📩 Получен ответ от администратора по вашему обращению №{appeal_id} ({category}):\n\n{reply_text}"
+            if photo_id:
+                await bot.send_photo(target_user_id, photo=photo_id, caption=full_reply)
+            else:
+                await bot.send_message(target_user_id, full_reply)
+            await callback.message.edit_text("✅ Ответ успешно отправлен сотруднику!")
+            await callback.message.answer("Админ-панель:", reply_markup=admin_keyboard)
         except:
-            await message.answer("⚠️ Не удалось отправить сообщение сотруднику (возможно, он заблокировал бота).", reply_markup=admin_keyboard)
+            await callback.message.edit_text("⚠️ Не удалось отправить сообщение сотруднику (возможно, он заблокировал бота).")
+            await callback.message.answer("Админ-панель:", reply_markup=admin_keyboard)
     else:
-        await message.answer("❌ Обращение не найдено в базе.", reply_markup=admin_keyboard)
+        await callback.message.edit_text("❌ Ошибка: обращение не найдено в базе данных.")
+        await callback.message.answer("Админ-панель:", reply_markup=admin_keyboard)
     conn.close()
+    await callback.answer()
 
 @router.message(F.text == "📁 Актуальные обращения")
 async def show_active_appeals(message: Message):
     if message.from_user.id not in load_admins(): return
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT id, category, text, created_at, is_anon, user_name FROM appeals WHERE status = 'new'")
+    cursor.execute("SELECT id, category, text, photo_id, created_at, is_anon, user_name FROM appeals WHERE status = 'new'")
     appeals = cursor.fetchall()
     conn.close()
 
@@ -236,19 +325,22 @@ async def show_active_appeals(message: Message):
         return
 
     for app in appeals:
-        app_id, category, text, created_at, is_anon, user_name = app
+        app_id, category, text, photo_id, created_at, is_anon, user_name = app
         author = "🕵️‍♂️ Анонимно" if is_anon else f"👤 {user_name}"
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_appeal_{app_id}")]
         ])
-        await message.answer(f"📌 Обращение №{app_id}\n📂 {category}\nОт: {author}\n📅 {created_at}\n\n{text}", reply_markup=kb)
+        msg_text = f"📌 Обращение №{app_id}\n📂 {category}\nОт: {author}\n📅 {created_at}\n\n{text}"
+        if photo_id:
+            await message.answer_photo(photo=photo_id, caption=msg_text, reply_markup=kb)
+        else:
+            await message.answer(msg_text, reply_markup=kb)
 
 @router.message(F.text == "📁 Обращения за месяц")
 async def show_monthly_appeals(message: Message):
     if message.from_user.id not in load_admins(): return
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
-    # Берем обращения за последние 30 дней
     cursor.execute("SELECT id, category, status, created_at FROM appeals ORDER BY id DESC LIMIT 20")
     appeals = cursor.fetchall()
     conn.close()
