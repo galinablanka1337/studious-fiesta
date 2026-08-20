@@ -8,7 +8,6 @@ from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, BotCommand
 
-# --- CONFIG ---
 TOKEN = os.getenv("BOT_TOKEN")
 ADMINS_FILE = "admins.txt"
 SUPER_ADMIN_ID = 762076580
@@ -20,7 +19,6 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# --- DATABASE SETUP ---
 def init_db():
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
@@ -42,7 +40,6 @@ def init_db():
 
 init_db()
 
-# --- ADMINS ---
 def load_admins():
     admins = {SUPER_ADMIN_ID}
     if os.path.exists(ADMINS_FILE):
@@ -57,7 +54,6 @@ def save_admins(admins):
         for admin_id in admins:
             f.write(f"{admin_id}\n")
 
-# --- STATES ---
 waiting_for_text = {}
 pending_appeals = {}
 admin_reply_states = {}
@@ -65,7 +61,6 @@ pending_admin_replies = {}
 adding_admin_process = set()
 removing_admin_process = set()
 
-# --- KEYBOARDS ---
 employee_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="✍️ Анонимное обращение"), KeyboardButton(text="💡 Новые идеи")],
@@ -95,14 +90,11 @@ manage_admins_keyboard = ReplyKeyboardMarkup(
 
 cancel_keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Отменить и в меню")]], resize_keyboard=True)
 
-# --- START HANDLER ---
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     hour = datetime.now().hour
     user_id = message.from_user.id
     
-    # ПРИВЯЗКА КАРТИНОК ПО ВРЕМЕНИ
-    # image.png - ночь, image_2.png - вечер, image_3.png - утро, image_4.png - день
     if 5 <= hour < 12:
         greeting = "Доброе утро! ☀️"
         photo_file = "image_3.png"
@@ -143,7 +135,6 @@ async def cancel_action(message: Message):
     else:
         await message.answer("Главное меню:", reply_markup=employee_keyboard)
 
-# --- CATEGORY HANDLERS ---
 @router.message(F.text.in_(["✍️ Анонимное обращение", "💡 Новые идеи", "⚠️ Жалобы", "⚔️ Конфликт", "🤝 Помощь сотруднику", "💬 Другие вопросы", "🌴 Отпуска", "🏥 Больничные"]))
 async def select_category(message: Message):
     waiting_for_text[message.from_user.id] = {"category": message.text}
@@ -160,7 +151,6 @@ async def get_appeal_text(message: Message):
     ])
     await message.answer("📄 Проверьте текст обращения и выберите способ отправки:", reply_markup=kb)
 
-# --- CONFIRM & SEND (IMAGE_5.PNG) ---
 @router.callback_query(F.data.in_({"send_anon", "send_named"}))
 async def confirm_send_appeal(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -186,14 +176,12 @@ async def confirm_send_appeal(callback: CallbackQuery):
 
     await callback.message.edit_text("✅ Обращение успешно отправлено!")
     
-    # Благодарность сотруднику
     await callback.message.answer_photo(
         photo=FSInputFile("image_5.png"), 
         caption="Спасибо, что вы с нами! Мы на связи и готовы ПОМОЧЬ 💚"
     )
     await callback.answer()
 
-# --- ADMIN PANEL LOGIC ---
 @router.message(F.text == "📊 Статистика бота")
 async def admin_stats(message: Message):
     if message.from_user.id not in load_admins(): 
@@ -226,7 +214,6 @@ async def add_admin_action(message: Message):
     adding_admin_process.remove(message.from_user.id)
     await message.answer("✅ Админ добавлен!")
 
-# --- MAIN RUN ---
 async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
