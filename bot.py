@@ -6,14 +6,14 @@ from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 
 # ЗАМЕНИ ЭТУ СТРОКУ НА СВОЙ ТОКЕН БОТА ОТ @BotFather
-TOKEN = "ТУТ_ВСТАВЬ_СВОЙ_ТОКЕН_БОТА"
+TOKEN = "8998590593:AAFPr0DySSlO1BYOJRFR8fazQ_36TUbvFD8"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 router = Router()
 
 # Список ID администраторов (лидеров)
-ADMIN_IDS = [123456789, 987654321] 
+ADMIN_IDS = [762076580, 987654321] 
 
 # Имена твоих картинок в папке с ботом
 IMG_NIGHT = "image.png"     # Доброй ночи
