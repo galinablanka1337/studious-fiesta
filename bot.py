@@ -117,9 +117,26 @@ async def cmd_start(message: Message):
 
     admins = load_admins()
     if user_id in admins:
-        await message.answer(f"{greeting} Панель администратора активна:", reply_markup=admin_keyboard)
+        try:
+            await message.answer_photo(
+                photo=FSInputFile("image_1.png"),
+                caption=f"{greeting} Панель администратора активна:",
+                reply_markup=admin_keyboard
+            )
+        except Exception:
+            await message.answer(f"{greeting} Панель администратора активна:", reply_markup=admin_keyboard)
     else:
-        await message.answer(f"{greeting} 👋 Твой личный помощник во ВкусВилле на связи.\n\n👇 Выберите нужный раздел или категорию обращения ниже:", reply_markup=employee_keyboard)
+        try:
+            await message.answer_photo(
+                photo=FSInputFile("image_5.png"),
+                caption=f"{greeting} 👋 Твой личный помощник во ВкусВилле на связи.\n\n👇 Выберите нужный раздел или категорию обращения ниже:",
+                reply_markup=employee_keyboard
+            )
+        except Exception:
+            await message.answer(
+                f"{greeting} 👋 Твой личный помощник во ВкусВилле на связи.\n\n👇 Выберите нужный раздел или категорию обращения ниже:",
+                reply_markup=employee_keyboard
+            )
 
 @router.message(F.text == "🔙 В меню сотрудника")
 async def back_to_emp(message: Message):
@@ -149,14 +166,23 @@ async def select_category(message: Message):
     user_id = message.from_user.id
     cat = message.text
     if cat == "🌴 Отпуска":
-        await message.answer("🌴 **Информация по отпускам:** заявление подается за 2 недели.", parse_mode="Markdown")
+        try:
+            await message.answer_photo(photo=FSInputFile("image_3.png"), caption="🌴 **Информация по отпускам:** заявление подается за 2 недели.", parse_mode="Markdown")
+        except Exception:
+            await message.answer("🌴 **Информация по отпускам:** заявление подается за 2 недели.", parse_mode="Markdown")
         return
     elif cat == "🏥 Больничные":
-        await message.answer("🏥 **Больничные:** отправьте номер закрытого больничного в кадры.", parse_mode="Markdown")
+        try:
+            await message.answer_photo(photo=FSInputFile("image_4.png"), caption="🏥 **Больничные:** отправьте номер закрытого больничного в кадры.", parse_mode="Markdown")
+        except Exception:
+            await message.answer("🏥 **Больничные:** отправьте номер закрытого больничного в кадры.", parse_mode="Markdown")
         return
 
     waiting_for_text[user_id] = {"category": cat}
-    await message.answer(f"✍️ Вы выбрали: **{cat}**\n\nНапишите ваш вопрос или проблему одним сообщением:", reply_markup=cancel_keyboard, parse_mode="Markdown")
+    try:
+        await message.answer_photo(photo=FSInputFile("image_2.png"), caption=f"✍️ Вы выбрали: **{cat}**\n\nНапишите ваш вопрос или проблему одним сообщением:", parse_mode="Markdown")
+    except Exception:
+        await message.answer(f"✍️ Вы выбрали: **{cat}**\n\nНапишите ваш вопрос или проблему одним сообщением:", parse_mode="Markdown", reply_markup=cancel_keyboard)
 
 @router.message(F.text & F.from_user.id.in_(waiting_for_text))
 async def get_appeal_text(message: Message):
@@ -287,13 +313,11 @@ async def close_appeal(callback: CallbackQuery):
 async def noop(callback: CallbackQuery):
     await callback.answer("Обращение уже обрабатывается.", show_alert=True)
 
-# Защита от перехвата меню и подготовка ответа админа
 @router.message(F.from_user.id.in_(admin_reply_states))
 async def admin_prepare_reply(message: Message):
     admin_id = message.from_user.id
     text = message.text
 
-    # Если админ нажал на любую кнопку админ-панели во время ввода ответа — сбрасываем режим ввода
     admin_menu_buttons = {"📁 Актуальные обращения", "📊 Статистика бота", "📁 Обращения за месяц", "👥 Управление админами", "🔙 В меню сотрудника"}
     if text in admin_menu_buttons:
         admin_reply_states.pop(admin_id, None)
