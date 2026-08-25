@@ -7,6 +7,7 @@ import logging
 import os
 import sqlite3
 import tempfile
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -33,7 +34,24 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("❌ Не найден BOT_TOKEN!")
 
-DB_PATH = os.getenv("BOT_DB_PATH", "bot_database.db")
+_default_data_dir = Path("/app/data") if Path("/app/data").exists() else Path("data")
+DATA_DIR = Path(os.getenv("BOT_DATA_DIR", str(_default_data_dir)))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_DIR = Path(os.getenv("BOT_BACKUP_DIR", str(DATA_DIR / "backups")))
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+# Optional second mounted/external backup location. Configure on the host.
+EXTERNAL_BACKUP_DIR = os.getenv("BOT_EXTERNAL_BACKUP_DIR", "").strip()
+_legacy_db = Path("bot_database.db")
+_default_db = DATA_DIR / "bot_database.db"
+if "BOT_DB_PATH" in os.environ:
+    DB_PATH = os.environ["BOT_DB_PATH"]
+else:
+    # One-time migration from the old repository-root database.
+    if _legacy_db.exists() and not _default_db.exists():
+        import shutil as _shutil
+        _shutil.copy2(_legacy_db, _default_db)
+    DB_PATH = str(_default_db)
+Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 ADMINS_FILE = os.getenv("ADMINS_FILE", "admins.txt")
 SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "762076580"))
 TIMEZONE_NAME = os.getenv("BOT_TIMEZONE", "Europe/Moscow")
@@ -44,6 +62,12 @@ except Exception:
 
 # Пути к приветственным изображениям. При необходимости их можно
 # переопределить переменными окружения GREETING_MORNING/DAY/EVENING/NIGHT.
+THANKS_IMAGE = os.getenv("THANKS_IMAGE", "IMG_4457.jpeg")
+SPAM_IMAGE = os.getenv("SPAM_IMAGE", "IMG_10MIN_SPAM.jpeg")
+NEW_APPEAL_COOLDOWN_MINUTES = 10
+REMINDER_FIRST_MINUTES = 30
+REMINDER_REPEAT_MINUTES = 60
+
 GREETING_FILES = {
     # Новые картинки приветствия:
     # morning — «Доброе утро», day — «Добрый день»,
@@ -78,7 +102,12 @@ compose_user: dict[int, int] = {}
 compose_admin: dict[int, int] = {}
 new_appeal_state: dict[int, dict] = {}
 admin_process: dict[int, str] = {}
+knowledge_search_user: dict[int, bool] = {}
 period_state: dict[int, str] = {}
+pending_user_reply: dict[int, dict] = {}
+pending_admin_reply: dict[int, dict] = {}
+broadcast_draft: dict[int, dict] = {}
+pending_admin_action: dict[int, dict] = {}
 
 # ============================================================
 # DATABASE
@@ -170,8 +199,78 @@ def init_db() -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS announcements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            active INTEGER DEFAULT 1
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_base (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            active INTEGER DEFAULT 1
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS appeal_reminders (
+            appeal_id INTEGER PRIMARY KEY,
+            last_sent_at TEXT,
+            reminder_count INTEGER DEFAULT 0
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS admin_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            appeal_id INTEGER,
+            details TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS appeal_locks (
+            appeal_id INTEGER PRIMARY KEY,
+            admin_id INTEGER NOT NULL,
+            locked_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS broadcasts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            text TEXT,
+            media_type TEXT,
+            media_id TEXT,
+            success_count INTEGER DEFAULT 0,
+            failed_count INTEGER DEFAULT 0
+        )
+        """
+    )
 
     # Safe migrations for the old database shipped with the original bot.
+    user_cols = {row[1] for row in cur.execute("PRAGMA table_info(users)")}
+    if "last_appeal_at" not in user_cols:
+        cur.execute("ALTER TABLE users ADD COLUMN last_appeal_at TEXT")
+
     appeal_cols = {row[1] for row in cur.execute("PRAGMA table_info(appeals)")}
     for name, sql in [
         ("closed_at", "ALTER TABLE appeals ADD COLUMN closed_at TEXT"),
@@ -218,6 +317,8 @@ def is_user_blocked(user_id: int) -> bool:
 
 
 def register_user(user_id: int, user_name: str) -> None:
+    # Registration is persistent in SQLite. Removing a Telegram chat does not
+    # remove this record.
     if is_user_blocked(user_id):
         return
     conn = db()
@@ -230,6 +331,131 @@ def register_user(user_id: int, user_name: str) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def appeal_cooldown_remaining(user_id: int) -> int:
+    """Seconds remaining before a new appeal may be created."""
+    conn = db()
+    row = conn.execute(
+        "SELECT last_appeal_at FROM users WHERE user_id=?", (user_id,)
+    ).fetchone()
+    conn.close()
+    if not row or not row[0]:
+        return 0
+    try:
+        last = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S").replace(tzinfo=BOT_TZ)
+    except ValueError:
+        return 0
+    remaining = int(
+        (last + timedelta(minutes=NEW_APPEAL_COOLDOWN_MINUTES) - datetime.now(BOT_TZ)).total_seconds()
+    )
+    return max(0, remaining)
+
+
+def mark_new_appeal_time(user_id: int, timestamp: str) -> None:
+    conn = db()
+    conn.execute("UPDATE users SET last_appeal_at=? WHERE user_id=?", (timestamp, user_id))
+    conn.commit()
+    conn.close()
+
+
+def format_remaining(seconds: int) -> str:
+    minutes, secs = divmod(max(0, seconds), 60)
+    if minutes:
+        return f"{minutes} мин. {secs:02d} сек."
+    return f"{secs} сек."
+
+
+def log_admin_action(admin_id: int, action: str, appeal_id: Optional[int] = None, details: str = "") -> None:
+    conn = db()
+    conn.execute(
+        "INSERT INTO admin_actions(admin_id,action,appeal_id,details,created_at) VALUES(?,?,?,?,?)",
+        (admin_id, action, appeal_id, details, now_str()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def acquire_appeal_lock(appeal_id: int, admin_id: int) -> bool:
+    conn = db()
+    try:
+        conn.execute(
+            "INSERT INTO appeal_locks(appeal_id,admin_id,locked_at) VALUES(?,?,?)",
+            (appeal_id, admin_id, now_str()),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        row = conn.execute("SELECT admin_id FROM appeal_locks WHERE appeal_id=?", (appeal_id,)).fetchone()
+        conn.rollback()
+        return bool(row and row[0] == admin_id)
+    finally:
+        conn.close()
+
+
+def release_appeal_lock(appeal_id: int, admin_id: Optional[int] = None) -> None:
+    conn = db()
+    if admin_id is None:
+        conn.execute("DELETE FROM appeal_locks WHERE appeal_id=?", (appeal_id,))
+    else:
+        conn.execute("DELETE FROM appeal_locks WHERE appeal_id=? AND admin_id=?", (appeal_id, admin_id))
+    conn.commit()
+    conn.close()
+
+
+def get_appeal_lock(appeal_id: int):
+    conn = db()
+    row = conn.execute("SELECT admin_id,locked_at FROM appeal_locks WHERE appeal_id=?", (appeal_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def safe_backup_database() -> Optional[Path]:
+    """Create a consistent SQLite backup and optionally copy it to a second mounted location."""
+    source = Path(DB_PATH)
+    if not source.exists():
+        return None
+    stamp = datetime.now(BOT_TZ).strftime("%Y%m%d_%H%M%S")
+    target = BACKUP_DIR / f"bot_database_{stamp}.db"
+    src_conn = sqlite3.connect(str(source))
+    dst_conn = sqlite3.connect(str(target))
+    try:
+        src_conn.backup(dst_conn)
+        dst_conn.commit()
+    finally:
+        dst_conn.close()
+        src_conn.close()
+    if EXTERNAL_BACKUP_DIR:
+        ext = Path(EXTERNAL_BACKUP_DIR)
+        ext.mkdir(parents=True, exist_ok=True)
+        ext_target = ext / target.name
+        if ext.resolve() != BACKUP_DIR.resolve():
+            shutil.copy2(target, ext_target)
+            ext_backups = sorted(ext.glob("bot_database_*.db"))
+            for old_ext in ext_backups[:-30]:
+                try:
+                    old_ext.unlink()
+                except OSError:
+                    pass
+    # Keep 30 local copies.
+    backups = sorted(BACKUP_DIR.glob("bot_database_*.db"))
+    for old in backups[:-30]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return target
+
+
+def verify_database() -> bool:
+    try:
+        conn = db()
+        row = conn.execute("PRAGMA integrity_check").fetchone()
+        conn.close()
+        return bool(row and row[0] == "ok")
+    except Exception:
+        logging.exception("Проверка БД не удалась")
+        return False
 
 
 def load_admins() -> set[int]:
@@ -342,6 +568,7 @@ employee_keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text="🌴 Отпуска"), KeyboardButton(text="🏥 Больничные")],
         [KeyboardButton(text="💰 Зарплата"), KeyboardButton(text="📅 График")],
         [KeyboardButton(text="🌱 Как ваше настроение?")],
+        [KeyboardButton(text="📢 Важные объявления"), KeyboardButton(text="📚 База знаний")],
     ],
     resize_keyboard=True,
 )
@@ -354,6 +581,9 @@ admin_keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text="📥 Выгрузить отчет за период"), KeyboardButton(text="📥 Выгрузить обращения (CSV)")],
         [KeyboardButton(text="👥 Список участников"), KeyboardButton(text="👥 Управление админами")],
         [KeyboardButton(text="🚫 Черный список"), KeyboardButton(text="📢 Сделать рассылку")],
+        [KeyboardButton(text="📢 Управление объявлениями"), KeyboardButton(text="📚 База знаний")],
+        [KeyboardButton(text="🔎 Поиск обращений"), KeyboardButton(text="🧰 Фильтры обращений")],
+        [KeyboardButton(text="💾 Резервная копия")],
     ],
     resize_keyboard=True,
 )
@@ -383,6 +613,7 @@ def admin_ticket_keyboard(appeal_id: int, can_reply: bool = True) -> InlineKeybo
     rows = []
     if can_reply:
         rows.append([InlineKeyboardButton(text="💬 Ответить", callback_data=f"a_reply:{appeal_id}")])
+    rows.append([InlineKeyboardButton(text="👨‍💼 Взять обращение", callback_data=f"claim:{appeal_id}")])
     rows.append([InlineKeyboardButton(text="📜 История", callback_data=f"history:{appeal_id}")])
     rows.append([InlineKeyboardButton(text="🔒 Закрыть", callback_data=f"a_close:{appeal_id}")])
     rows.append([InlineKeyboardButton(text="🚫 Заблокировать автора", callback_data=f"ban:{appeal_id}")])
@@ -398,6 +629,52 @@ def rating_keyboard(appeal_id: int) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def new_appeal_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Отправить обращение", callback_data="submit_new")],
+            [InlineKeyboardButton(text="✏️ Изменить", callback_data="edit_new"),
+             InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_new")],
+        ]
+    )
+
+
+def reply_confirm_keyboard(kind: str) -> InlineKeyboardMarkup:
+    prefix = "u" if kind == "user" else "a"
+    send_text = "🚀 Отправить сотруднику" if kind == "admin" else "🚀 Отправить поддержке"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=send_text, callback_data=f"confirm_reply:{prefix}")],
+            [InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit_reply:{prefix}"),
+             InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_reply:{prefix}")],
+        ]
+    )
+
+
+def broadcast_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➡️ Продолжить", callback_data="broadcast_prepare")],
+            [InlineKeyboardButton(text="✏️ Изменить", callback_data="broadcast_edit"),
+             InlineKeyboardButton(text="❌ Отменить", callback_data="broadcast_cancel")],
+        ]
+    )
+
+
+def broadcast_final_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🚨 ДА, ОТПРАВИТЬ ВСЕМ", callback_data="broadcast_send")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="broadcast_cancel")],
+        ]
+    )
+
+
+def preview_content_text(media_type: str, text: str) -> str:
+    label = "📝 Текст" if media_type == "text" else ("🖼 Фото" if media_type == "photo" else "🎥 Видео")
+    return f"{label}\n{html.escape(text or 'Без текста')}"
 
 
 # ============================================================
@@ -455,6 +732,7 @@ async def cmd_start(message: Message):
     compose_admin.pop(user_id, None)
     new_appeal_state.pop(user_id, None)
     admin_process.pop(user_id, None)
+    knowledge_search_user.pop(user_id, None)
     await send_start_screen(message)
 
 
@@ -473,7 +751,12 @@ async def cancel_action(message: Message):
     compose_admin.pop(user_id, None)
     new_appeal_state.pop(user_id, None)
     admin_process.pop(user_id, None)
+    knowledge_search_user.pop(user_id, None)
     period_state.pop(user_id, None)
+    pending_user_reply.pop(user_id, None)
+    pending_admin_reply.pop(user_id, None)
+    broadcast_draft.pop(user_id, None)
+    pending_admin_action.pop(user_id, None)
     if user_id in load_admins():
         await message.answer("🛠 Возвращаемся в панель администратора:", reply_markup=admin_keyboard)
     else:
@@ -564,24 +847,24 @@ async def admin_numeric_process(message: Message):
             pass
         return
 
-    if action == "add_admin":
-        admins = load_admins()
-        admins.add(target_id)
-        save_admins(admins)
-        await message.answer(f"✅ Администратор <code>{target_id}</code> добавлен.", reply_markup=manage_admins_keyboard)
-        return
-
-    if action == "remove_admin":
-        if target_id == SUPER_ADMIN_ID:
+    if action in {"add_admin", "remove_admin"}:
+        if action == "remove_admin" and target_id == SUPER_ADMIN_ID:
             await message.answer("❌ Нельзя удалить главного администратора.", reply_markup=manage_admins_keyboard)
             return
-        admins = load_admins()
-        if target_id in admins:
-            admins.remove(target_id)
-            save_admins(admins)
-            await message.answer(f"✅ Администратор <code>{target_id}</code> удален.", reply_markup=manage_admins_keyboard)
-        else:
-            await message.answer("❌ Такого администратора нет.", reply_markup=manage_admins_keyboard)
+        pending_admin_action[admin_id] = {"action": action, "target_id": target_id}
+        verb = "добавить" if action == "add_admin" else "удалить"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"✅ Да, {verb}", callback_data="admin_action:confirm")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_action:cancel")],
+        ])
+        await message.answer(
+            f"⚠️ <b>Подтвердите действие</b>\n\n"
+            f"Действие: <b>{verb} администратора</b>\n"
+            f"Telegram ID: <code>{target_id}</code>\n\n"
+            "Изменение прав будет применено сразу.",
+            reply_markup=kb,
+        )
+        return
 
 
 @router.callback_query(F.data.startswith("ban:"))
@@ -629,6 +912,32 @@ async def send_csv(message: Message, headers, rows, prefix: str, caption: str):
             os.remove(path)
         except OSError:
             pass
+
+
+@router.message(F.text == "💾 Резервная копия")
+async def backup_menu(message: Message):
+    if message.from_user.id not in load_admins():
+        return
+    try:
+        target = safe_backup_database()
+        healthy = verify_database()
+        if not target:
+            await message.answer("❌ Не удалось создать резервную копию.", reply_markup=admin_keyboard)
+            return
+        extra = "Вторая копия: настроена." if EXTERNAL_BACKUP_DIR else "⚠️ Вторая независимая копия не настроена."
+        await message.answer(
+            "💾 <b>РЕЗЕРВНАЯ КОПИЯ СОЗДАНА</b>\n\n"
+            f"📁 {html.escape(str(target))}\n"
+            f"🧪 Проверка БД: {'✅ OK' if healthy else '❌ ОШИБКА'}\n"
+            f"{extra}\n\n"
+            "Для максимальной защиты на BotHost подключите постоянный Volume к /app/data "
+            "и отдельное постоянное хранилище для BOT_EXTERNAL_BACKUP_DIR.",
+            reply_markup=admin_keyboard,
+        )
+        log_admin_action(message.from_user.id, "manual_backup", details=str(target))
+    except Exception:
+        logging.exception("Ошибка ручного backup")
+        await message.answer("❌ Ошибка при создании резервной копии.", reply_markup=admin_keyboard)
 
 
 @router.message(F.text == "📊 Статистика бота")
@@ -899,6 +1208,46 @@ async def ask_remove_admin(message: Message):
 # ============================================================
 # MOOD / WEEKLY POLL
 # ============================================================
+@router.callback_query(F.data == "admin_action:confirm")
+async def confirm_admin_action(callback: CallbackQuery):
+    admin_id = callback.from_user.id
+    if admin_id not in load_admins():
+        return
+    draft = pending_admin_action.pop(admin_id, None)
+    if not draft:
+        await callback.answer("Действие уже обработано", show_alert=True)
+        return
+    target_id = draft["target_id"]
+    admins = load_admins()
+    if draft["action"] == "add_admin":
+        admins.add(target_id)
+        save_admins(admins)
+        log_admin_action(admin_id, "add_admin", details=str(target_id))
+        text = f"✅ Администратор <code>{target_id}</code> добавлен."
+    else:
+        if target_id == SUPER_ADMIN_ID:
+            await callback.answer("Главного администратора удалить нельзя", show_alert=True)
+            return
+        if target_id in admins:
+            admins.remove(target_id)
+            if not admins:
+                admins.add(SUPER_ADMIN_ID)
+            save_admins(admins)
+            log_admin_action(admin_id, "remove_admin", details=str(target_id))
+            text = f"✅ Администратор <code>{target_id}</code> удалён."
+        else:
+            text = "❌ Такого администратора нет."
+    await callback.message.answer(text, reply_markup=manage_admins_keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_action:cancel")
+async def cancel_admin_action(callback: CallbackQuery):
+    pending_admin_action.pop(callback.from_user.id, None)
+    await callback.message.answer("❌ Изменение администраторов отменено.", reply_markup=manage_admins_keyboard)
+    await callback.answer()
+
+
 @router.message(F.text == "🌱 Как ваше настроение?")
 async def ask_mood(message: Message):
     if is_user_blocked(message.from_user.id):
@@ -953,6 +1302,90 @@ async def save_weekly_poll(callback: CallbackQuery):
 
 
 # ============================================================
+# VACATION / SICK LEAVE REFERENCE
+# ============================================================
+@router.message(F.text == "🌴 Отпуска")
+async def vacation_info(message: Message):
+    if is_user_blocked(message.from_user.id):
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Как оформить отпуск", callback_data="info:vacation_apply")],
+        [InlineKeyboardButton(text="💰 Отпускные", callback_data="info:vacation_pay")],
+        [InlineKeyboardButton(text="📅 Первый отпуск", callback_data="info:vacation_first")],
+        [InlineKeyboardButton(text="✍️ Задать вопрос", callback_data="info:ask_vacation")],
+    ])
+    await message.answer(
+        "🌴 <b>ОТПУСК</b>\n\n"
+        "Здесь собраны основные правила из памятки по отпуску.\n\n"
+        "Выберите интересующий раздел:",
+        reply_markup=kb,
+    )
+
+
+@router.message(F.text == "🏥 Больничные")
+async def sick_info(message: Message):
+    if is_user_blocked(message.from_user.id):
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Что делать с больничным", callback_data="info:sick_send")],
+        [InlineKeyboardButton(text="💰 Когда выплата", callback_data="info:sick_pay")],
+        [InlineKeyboardButton(text="🌴 Пересечение с отпуском", callback_data="info:sick_vacation")],
+        [InlineKeyboardButton(text="✍️ Задать вопрос", callback_data="info:ask_sick")],
+    ])
+    await message.answer(
+        "🏥 <b>БОЛЬНИЧНЫЙ ЛИСТ</b>\n\n"
+        "Выберите интересующий раздел:",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("info:"))
+async def info_callback(callback: CallbackQuery):
+    if is_user_blocked(callback.from_user.id):
+        return
+    key = callback.data.split(":", 1)[1]
+    texts = {
+        "vacation_apply":
+            "📋 <b>Как оформить отпуск</b>\n\n"
+            "Заранее предупреди лидера и/или коллег о планируемом отпуске.\n\n"
+            "Напиши электронное письмо с указанием ФИО и периода отпуска с копией лидеру.\n\n"
+            "⚠️ Письмо на отпуск отправляется за <b>две недели до планируемой даты отпуска</b>.\n\n"
+            "📧 Москва и МО: kadri@izbenka.msk.ru\n"
+            "📧 Регионы: region@vkusvill.ru\n"
+            "📧 Санкт-Петербург: kdpspb@vkusvill.ru",
+        "vacation_pay":
+            "💰 <b>Отпускные</b>\n\n"
+            "Расчёт отпускных происходит из среднего заработка расчётного периода, за который оформляется отпуск.\n\n"
+            "Выплата отпускных начисляется за <b>3–4 дня до даты начала отпуска</b>.",
+        "vacation_first":
+            "📅 <b>Когда можно уйти в первый отпуск?</b>\n\n"
+            "Первый отпуск предоставляется через <b>6 месяцев</b> с начала работы.\n"
+            "Если отпуск понадобился раньше, обсуди такую возможность с лидером.",
+        "sick_send":
+            "📋 <b>Куда направить данные больничного?</b>\n\n"
+            "Номер больничного после закрытия необходимо направить на электронную почту отдела кадров для проведения выплаты.\n\n"
+            "Данные будут обработаны в течение <b>трёх календарных дней</b>.\n\n"
+            "📧 Москва и МО: kadri@izbenka.msk.ru\n"
+            "📧 Регионы: region@vkusvill.ru\n"
+            "📧 Санкт-Петербург: kdpspb@vkusvill.ru",
+        "sick_pay":
+            "💰 <b>Когда производится выплата?</b>\n\n"
+            "Выплаты пособий по больничному производятся частями:\n\n"
+            "• первые три дня — за счёт работодателя в ближайший день выплаты зарплаты (10 или 25 числа месяца);\n"
+            "• оставшиеся дни — за счёт СФР в течение 10 рабочих дней после получения данных от работодателя.",
+        "sick_vacation":
+            "🌴 <b>Если больничный пересекается с отпуском</b>\n\n"
+            "В день закрытия больничного сотрудник отдела кадров направит заявление о переносе или продлении отпуска через КЭДО (HRlink).",
+        "ask_vacation":
+            "✍️ <b>Вопрос по отпуску</b>\n\nВыберите «🌴 Отпуска» ещё раз и воспользуйтесь справкой или создайте обращение по нужной категории.",
+        "ask_sick":
+            "✍️ <b>Вопрос по больничному</b>\n\nВыберите «🏥 Больничные» ещё раз и воспользуйтесь справкой или создайте обращение по нужной категории.",
+    }
+    await callback.message.answer(texts.get(key, "ℹ️ Раздел не найден."), reply_markup=employee_keyboard)
+    await callback.answer()
+
+
+# ============================================================
 # APPEAL CREATION
 # ============================================================
 @router.message(F.text.in_(CATEGORIES))
@@ -960,13 +1393,33 @@ async def select_category(message: Message):
     user_id = message.from_user.id
     if is_user_blocked(user_id):
         return
+    if message.text in {"🌴 Отпуска", "🏥 Больничные"}:
+        return
+
+    # Existing active ticket takes priority over cooldown.
     active = active_appeal_for_user(user_id)
     if active:
         await message.answer(
-            f"⚠️ У вас уже есть открытое обращение №{active}. Сначала продолжите его или закройте.",
+            f"⚠️ У вас уже есть открытое обращение №{active}. "
+            "Продолжите его или закройте.",
             reply_markup=employee_ticket_keyboard(active, can_reply=True),
         )
         return
+
+    remaining = appeal_cooldown_remaining(user_id)
+    if remaining:
+        text = (
+            "🛡️ <b>Небольшая пауза</b>\n\n"
+            "Вы уже отправили обращение.\n"
+            f"Новое обращение можно будет создать через <b>{format_remaining(remaining)}</b>.\n\n"
+            "💬 Если хотите продолжить текущий диалог — откройте своё обращение."
+        )
+        if Path(SPAM_IMAGE).exists():
+            await message.answer_photo(FSInputFile(SPAM_IMAGE), caption=text, reply_markup=employee_keyboard)
+        else:
+            await message.answer(text, reply_markup=employee_keyboard)
+        return
+
     new_appeal_state[user_id] = {
         "category": message.text,
         "force_anonymous": message.text == "✍️ Анонимное обращение",
@@ -984,7 +1437,9 @@ async def choose_urgency(callback: CallbackQuery):
     if is_user_blocked(user_id) or user_id not in new_appeal_state:
         await callback.answer("Сессия обращения устарела", show_alert=True)
         return
-    new_appeal_state[user_id]["urgency"] = "🔴 Срочное" if callback.data.endswith("urgent") else "🟢 Обычное"
+    priority_map = {"normal": "🟢 Обычное", "important": "🟡 Важное", "urgent": "🔴 Срочное"}
+    key = callback.data.split(":", 1)[1]
+    new_appeal_state[user_id]["urgency"] = priority_map.get(key, "🟢 Обычное")
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🕵️ Отправить анонимно", callback_data="anon:1")],
@@ -1012,13 +1467,66 @@ async def confirm_send_appeal(callback: CallbackQuery):
     user_id = callback.from_user.id
     if is_user_blocked(user_id):
         return
-    data = new_appeal_state.pop(user_id, None)
+    data = new_appeal_state.get(user_id)
     if not data:
         await callback.answer("Сессия обращения устарела", show_alert=True)
         return
     requested_anon = int(callback.data.split(":", 1)[1])
-    is_anon = 1 if data.get("force_anonymous") else requested_anon
+    data["is_anon"] = 1 if data.get("force_anonymous") else requested_anon
+    author = "🕵️ Анонимно" if data["is_anon"] else f"👤 {html.escape(callback.from_user.full_name)}"
+    preview = (
+        "📋 <b>ПРОВЕРЬТЕ ОБРАЩЕНИЕ ПЕРЕД ОТПРАВКОЙ</b>\n\n"
+        f"📂 <b>Категория:</b> {html.escape(data['category'])}\n"
+        f"⚠️ <b>Срочность:</b> {html.escape(data.get('urgency', '🟢 Обычное'))}\n"
+        f"👤 <b>Отправитель:</b> {author}\n\n"
+        f"{preview_content_text(data['media_type'], data['text'])}\n\n"
+        "⚠️ После подтверждения обращение будет передано поддержке."
+    )
+    await callback.message.answer(preview, reply_markup=new_appeal_confirm_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "edit_new")
+async def edit_new_appeal(callback: CallbackQuery):
+    data = new_appeal_state.get(callback.from_user.id)
+    if not data:
+        await callback.answer("Сессия устарела", show_alert=True)
+        return
+    data.pop("media_type", None)
+    data.pop("media_id", None)
+    data.pop("text", None)
+    await callback.message.answer(
+        "✏️ <b>Изменение обращения</b>\n\nОтправьте исправленный текст, фото или видео.",
+        reply_markup=cancel_keyboard,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "submit_new")
+async def submit_new_appeal(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if is_user_blocked(user_id):
+        return
+    data = new_appeal_state.get(user_id)
+    if not data:
+        await callback.answer("Сессия обращения устарела", show_alert=True)
+        return
+    if active_appeal_for_user(user_id):
+        new_appeal_state.pop(user_id, None)
+        await callback.answer("У вас уже есть открытое обращение", show_alert=True)
+        return
+    remaining = appeal_cooldown_remaining(user_id)
+    if remaining:
+        new_appeal_state.pop(user_id, None)
+        await callback.message.answer(
+            f"⏳ Новое обращение можно будет отправить через <b>{format_remaining(remaining)}</b>.",
+            reply_markup=employee_keyboard,
+        )
+        await callback.answer()
+        return
+
     ts = now_str()
+    is_anon = int(data.get("is_anon", 1))
     conn = db()
     cur = conn.cursor()
     cur.execute(
@@ -1026,51 +1534,56 @@ async def confirm_send_appeal(callback: CallbackQuery):
         INSERT INTO appeals(user_id,user_name,category,urgency,is_anon,status,created_at,last_activity_at)
         VALUES(?,?,?,?,?,?,?,?)
         """,
-        (user_id, callback.from_user.full_name, data["category"], data["urgency"], is_anon, "waiting_admin", ts, ts),
+        (user_id, callback.from_user.full_name, data["category"], data["urgency"],
+         is_anon, "waiting_admin", ts, ts),
     )
     appeal_id = cur.lastrowid
-    media_type = data["media_type"]
-    media_id = data["media_id"]
+    media_type, media_id, text = data["media_type"], data["media_id"], data["text"]
     cur.execute(
         """
         INSERT INTO messages_log(appeal_id,sender_id,sender_role,text,photo_id,video_id,media_type,created_at)
         VALUES(?,?,?,?,?,?,?,?)
         """,
-        (
-            appeal_id, user_id, "employee", data["text"],
-            media_id if media_type == "photo" else None,
-            media_id if media_type == "video" else None,
-            media_type, ts,
-        ),
+        (appeal_id, user_id, "employee", text,
+         media_id if media_type == "photo" else None,
+         media_id if media_type == "video" else None,
+         media_type, ts),
     )
+    conn.execute("UPDATE users SET last_appeal_at=? WHERE user_id=?", (ts, user_id))
     conn.commit()
     conn.close()
+    new_appeal_state.pop(user_id, None)
 
-    author = "🕵️ Анонимный сотрудник" if is_anon else f"👤 {html.escape(callback.from_user.full_name)}"
+    author = "🕵️ <b>Анонимный сотрудник</b>" if is_anon else f"👤 <b>{html.escape(callback.from_user.full_name)}</b>"
     admin_text = (
-        f"🚨 <b>Новое обращение №{appeal_id}</b> [{data['urgency']}]\n"
+        f"🚨 <b>НОВОЕ ОБРАЩЕНИЕ №{appeal_id}</b> [{data['urgency']}]\n"
         f"📂 {html.escape(data['category'])}\n"
         f"От: {author}\n\n"
-        f"💬 {html.escape(data['text'] or 'Без текста')}"
+        f"💬 {html.escape(text or 'Без текста')}"
     )
     for admin_id in load_admins():
         try:
-            await send_content_to_chat(
-                admin_id, data["media_type"], data["media_id"], admin_text,
-                admin_ticket_keyboard(appeal_id, can_reply=True),
-            )
+            await send_content_to_chat(admin_id, media_type, media_id, admin_text,
+                                       admin_ticket_keyboard(appeal_id, can_reply=True))
         except Exception:
             logging.exception("Не удалось уведомить администратора %s", admin_id)
 
-    await callback.message.answer(
-        f"✅ Обращение №{appeal_id} передано поддержке.\n\n"
-        "После ответа поддержки здесь появится кнопка <b>«Ответить поддержке»</b>. "
-        "Так диалог продолжается по очереди и не закрывается после одного ответа.",
-        reply_markup=employee_ticket_keyboard(appeal_id, can_reply=False),
+    thanks = (
+        f"✅ <b>Спасибо за ваше обращение №{appeal_id}!</b>\n\n"
+        "Обращение принято и передано поддержке.\n\n"
+        "🕙 <b>Рабочее время поддержки: 10:00–22:00.</b>\n"
+        "Если обращение отправлено вне рабочего времени, ответ будет дан в рабочее время.\n\n"
+        "💬 После ответа поддержки здесь появится кнопка «Ответить поддержке»."
     )
-    await callback.answer()
-
-
+    if Path(THANKS_IMAGE).exists():
+        await callback.message.answer_photo(
+            FSInputFile(THANKS_IMAGE), caption=thanks,
+            reply_markup=employee_ticket_keyboard(appeal_id, can_reply=False)
+        )
+    else:
+        logging.warning("Файл благодарности не найден: %s", THANKS_IMAGE)
+        await callback.message.answer(thanks, reply_markup=employee_ticket_keyboard(appeal_id, can_reply=False))
+    await callback.answer("Обращение отправлено")
 
 
 # ============================================================
@@ -1094,18 +1607,54 @@ async def employee_reply_button(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("claim:"))
+async def claim_appeal(callback: CallbackQuery):
+    admin_id = callback.from_user.id
+    if admin_id not in load_admins():
+        return
+    appeal_id = int(callback.data.split(":", 1)[1])
+    row = get_appeal(appeal_id)
+    if not row or row[6] == "closed":
+        await callback.answer("Обращение закрыто или не найдено", show_alert=True)
+        return
+    lock = get_appeal_lock(appeal_id)
+    if lock and lock[0] != admin_id:
+        await callback.answer("⚠️ Обращение уже взял другой администратор.", show_alert=True)
+        return
+    if acquire_appeal_lock(appeal_id, admin_id):
+        log_admin_action(admin_id, "claim_appeal", appeal_id)
+        await callback.message.answer(
+            f"🔒 <b>Обращение №{appeal_id} закреплено за вами.</b>\n"
+            "Другие администраторы не смогут одновременно начать ответ.",
+            reply_markup=admin_ticket_keyboard(appeal_id, can_reply=True),
+        )
+        await callback.answer("Обращение закреплено")
+    else:
+        await callback.answer("Не удалось закрепить обращение", show_alert=True)
+
+
 @router.callback_query(F.data.startswith("a_reply:"))
 async def admin_reply_button(callback: CallbackQuery):
-    if callback.from_user.id not in load_admins():
+    admin_id = callback.from_user.id
+    if admin_id not in load_admins():
         return
     appeal_id = int(callback.data.split(":", 1)[1])
     row = get_appeal(appeal_id)
     if not row or row[6] == "closed":
         await callback.answer("Тикет закрыт", show_alert=True)
         return
-    compose_admin[callback.from_user.id] = appeal_id
+    lock = get_appeal_lock(appeal_id)
+    if lock and lock[0] != admin_id:
+        await callback.answer("⚠️ Сначала дождитесь завершения работы другого администратора.", show_alert=True)
+        return
+    if not acquire_appeal_lock(appeal_id, admin_id):
+        await callback.answer("Обращение занято другим администратором", show_alert=True)
+        return
+    compose_admin[admin_id] = appeal_id
+    log_admin_action(admin_id, "start_reply", appeal_id)
     await callback.message.answer(
-        f"✍️ <b>Диалог по тикету №{appeal_id}</b>\nОтправьте одно сообщение: текст, фото или видео.",
+        f"✍️ <b>Диалог по тикету №{appeal_id}</b>\nОтправьте одно сообщение: текст, фото или видео.\n\n"
+        "👤 Сотрудник не увидит ваше имя.",
         reply_markup=cancel_keyboard,
     )
     await callback.answer()
@@ -1113,6 +1662,22 @@ async def admin_reply_button(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("u_close:"))
 async def employee_close(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    appeal_id = int(callback.data.split(":", 1)[1])
+    row = get_appeal(appeal_id)
+    if not row or row[1] != user_id or row[6] == "closed":
+        await callback.answer("Обращение недоступно", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔒 Да, закрыть", callback_data=f"u_close_confirm:{appeal_id}")],
+        [InlineKeyboardButton(text="↩️ Оставить открытым", callback_data=f"u_close_cancel:{appeal_id}")]
+    ])
+    await callback.message.answer("⚠️ <b>Закрыть обращение?</b>\n\nПосле закрытия диалог будет завершён, и для нового обращения будет действовать обычный лимит 10 минут.", reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("u_close_confirm:"))
+async def employee_close_confirm(callback: CallbackQuery):
     user_id = callback.from_user.id
     appeal_id = int(callback.data.split(":", 1)[1])
     row = get_appeal(appeal_id)
@@ -1142,8 +1707,27 @@ async def admin_close(callback: CallbackQuery):
     if not row:
         await callback.answer("Тикет не найден", show_alert=True)
         return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔒 Да, закрыть", callback_data=f"a_close_confirm:{appeal_id}")],
+        [InlineKeyboardButton(text="↩️ Оставить открытым", callback_data=f"a_close_cancel:{appeal_id}")]
+    ])
+    await callback.message.answer("⚠️ <b>Закрыть обращение?</b>\n\nПроверьте, что вопрос действительно решён.", reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("a_close_confirm:"))
+async def admin_close_confirm(callback: CallbackQuery):
+    if callback.from_user.id not in load_admins():
+        return
+    appeal_id = int(callback.data.split(":", 1)[1])
+    row = get_appeal(appeal_id)
+    if not row:
+        await callback.answer("Тикет не найден", show_alert=True)
+        return
     set_status(appeal_id, "closed")
+    release_appeal_lock(appeal_id)
     compose_admin.pop(callback.from_user.id, None)
+    log_admin_action(callback.from_user.id, "close_appeal", appeal_id)
     target_user_id = row[1]
     compose_user.pop(target_user_id, None)
     try:
@@ -1155,6 +1739,20 @@ async def admin_close(callback: CallbackQuery):
     except Exception:
         pass
     await callback.message.answer(f"✅ Обращение №{appeal_id} закрыто.")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("u_close_cancel:"))
+async def employee_close_cancel(callback: CallbackQuery):
+    await callback.message.answer("↩️ Обращение оставлено открытым.")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("a_close_cancel:"))
+async def admin_close_cancel(callback: CallbackQuery):
+    if callback.from_user.id not in load_admins():
+        return
+    await callback.message.answer("↩️ Обращение оставлено открытым.")
     await callback.answer()
 
 
@@ -1179,6 +1777,240 @@ async def save_csat_rating(callback: CallbackQuery):
         pass
     await callback.message.answer(f"Спасибо за оценку: {rating}/5 ⭐", reply_markup=employee_keyboard)
     await callback.answer()
+
+
+# ============================================================
+# ANNOUNCEMENTS / KNOWLEDGE BASE / SEARCH / FILTERS
+# ============================================================
+def admin_simple_cancel_keyboard(action: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить", callback_data=f"simple_cancel:{action}")]
+    ])
+
+
+@router.message(F.text == "📢 Важные объявления")
+async def show_announcements(message: Message):
+    conn = db()
+    rows = conn.execute("SELECT id,title,body,created_at FROM announcements WHERE active=1 ORDER BY id DESC LIMIT 20").fetchall()
+    conn.close()
+    if not rows:
+        await message.answer("📢 <b>Важные объявления</b>\n\nСейчас активных объявлений нет.", reply_markup=employee_keyboard)
+        return
+    parts = ["📢 <b>ВАЖНЫЕ ОБЪЯВЛЕНИЯ</b>"]
+    for aid, title, body, created in rows:
+        parts.append(f"\n━━━━━━━━━━━━━━\n📌 <b>{html.escape(title)}</b>\n{html.escape(body)}\n🕒 {created}")
+    await message.answer("\n".join(parts), reply_markup=employee_keyboard)
+
+
+@router.message(F.text == "📢 Управление объявлениями")
+async def manage_announcements(message: Message):
+    if message.from_user.id not in load_admins(): return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Новое объявление", callback_data="ann:new")],
+        [InlineKeyboardButton(text="📋 Активные объявления", callback_data="ann:list")],
+    ])
+    await message.answer("📢 <b>УПРАВЛЕНИЕ ОБЪЯВЛЕНИЯМИ</b>\n\nЗакреплённые объявления хранятся в базе и не исчезают после перезапуска бота.", reply_markup=kb)
+
+
+@router.callback_query(F.data == "ann:new")
+async def ann_new(callback: CallbackQuery):
+    if callback.from_user.id not in load_admins(): return
+    admin_process[callback.from_user.id] = "announcement_title"
+    await callback.message.answer("📢 Введите заголовок объявления:", reply_markup=cancel_keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "ann:list")
+async def ann_list(callback: CallbackQuery):
+    if callback.from_user.id not in load_admins(): return
+    conn=db(); rows=conn.execute("SELECT id,title,created_at FROM announcements WHERE active=1 ORDER BY id DESC").fetchall(); conn.close()
+    if not rows:
+        await callback.message.answer("Активных объявлений нет."); await callback.answer(); return
+    for aid,title,created in rows:
+        kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🗑 Снять с публикации", callback_data=f"ann:off:{aid}")]])
+        await callback.message.answer(f"📌 <b>{html.escape(title)}</b>\n🕒 {created}",reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ann:off:"))
+async def ann_off(callback: CallbackQuery):
+    if callback.from_user.id not in load_admins(): return
+    aid=int(callback.data.split(":")[-1]); conn=db(); conn.execute("UPDATE announcements SET active=0 WHERE id=?",(aid,)); conn.commit(); conn.close()
+    await callback.message.answer("✅ Объявление снято с публикации."); await callback.answer()
+
+
+@router.message(F.text == "📚 База знаний")
+async def knowledge_menu(message: Message):
+    is_admin = message.from_user.id in load_admins()
+    buttons = [[InlineKeyboardButton(text="🔎 Найти ответ", callback_data="kb:search")]]
+    if is_admin:
+        buttons.extend([
+            [InlineKeyboardButton(text="➕ Добавить материал", callback_data="kb:add")],
+            [InlineKeyboardButton(text="📋 Управление материалами", callback_data="kb:list")],
+        ])
+    await message.answer(
+        "📚 <b>БАЗА ЗНАНИЙ</b>\n\n"
+        "Сотрудники могут искать утверждённые ответы. "
+        "Администраторы могут добавлять, редактировать и архивировать материалы.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data == "kb:add")
+async def kb_add(callback: CallbackQuery):
+    if callback.from_user.id not in load_admins():
+        await callback.answer("Доступ только для администратора", show_alert=True); return
+    admin_process[callback.from_user.id] = "kb_title"
+    await callback.message.answer("📚 <b>Новый материал</b>\n\nВведите название материала:", reply_markup=cancel_keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "kb:list")
+async def kb_list(callback: CallbackQuery):
+    if callback.from_user.id not in load_admins():
+        await callback.answer("Доступ только для администратора", show_alert=True); return
+    conn = db()
+    rows = conn.execute("SELECT id,title,body FROM knowledge_base WHERE active=1 ORDER BY id DESC LIMIT 30").fetchall()
+    conn.close()
+    if not rows:
+        await callback.message.answer("📚 Активных материалов пока нет.")
+        await callback.answer(); return
+    await callback.message.answer("📚 <b>УПРАВЛЕНИЕ БАЗОЙ ЗНАНИЙ</b>\n\nВыберите материал:")
+    for kid, title, body in rows:
+        preview = (body or "").strip()
+        if len(preview) > 220:
+            preview = preview[:220] + "…"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Изменить", callback_data=f"kb:edit:{kid}"),
+             InlineKeyboardButton(text="🗄 Архивировать", callback_data=f"kb:archive:{kid}")]
+        ])
+        await callback.message.answer(
+            f"📚 <b>{html.escape(title)}</b>\n\n{html.escape(preview)}",
+            reply_markup=kb,
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("kb:edit:"))
+async def kb_edit(callback: CallbackQuery):
+    if callback.from_user.id not in load_admins():
+        await callback.answer("Доступ только для администратора", show_alert=True); return
+    try:
+        kid = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer("Некорректный материал", show_alert=True); return
+    conn = db()
+    row = conn.execute("SELECT id,title,body FROM knowledge_base WHERE id=? AND active=1", (kid,)).fetchone()
+    conn.close()
+    if not row:
+        await callback.answer("Материал не найден", show_alert=True); return
+    admin_process[callback.from_user.id] = f"kb_edit_body:{kid}"
+    await callback.message.answer(
+        f"✏️ <b>Редактирование: {html.escape(row[1])}</b>\n\n"
+        "Отправьте новый текст материала. Название останется прежним.",
+        reply_markup=cancel_keyboard,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("kb:archive:"))
+async def kb_archive(callback: CallbackQuery):
+    if callback.from_user.id not in load_admins():
+        await callback.answer("Доступ только для администратора", show_alert=True); return
+    try:
+        kid = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer("Некорректный материал", show_alert=True); return
+    conn = db(); row = conn.execute("SELECT title FROM knowledge_base WHERE id=? AND active=1", (kid,)).fetchone(); conn.close()
+    if not row:
+        await callback.answer("Материал уже архивирован или не найден", show_alert=True); return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да, архивировать", callback_data=f"kb:archive_yes:{kid}"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="kb:archive_no"),
+    ]])
+    await callback.message.answer(
+        f"🗄 <b>Архивировать материал?</b>\n\n«{html.escape(row[0])}»\n\n"
+        "Материал исчезнет из поиска сотрудников, но останется в базе и его можно будет восстановить позже.",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("kb:archive_yes:"))
+async def kb_archive_yes(callback: CallbackQuery):
+    if callback.from_user.id not in load_admins():
+        await callback.answer("Доступ только для администратора", show_alert=True); return
+    kid = int(callback.data.split(":")[-1])
+    conn = db(); conn.execute("UPDATE knowledge_base SET active=0 WHERE id=?", (kid,)); conn.commit(); conn.close()
+    log_admin_action(callback.from_user.id, "knowledge_archive", details=f"knowledge_id={kid}")
+    await callback.message.answer("🗄 Материал архивирован. Он не удалён из базы и больше не показывается сотрудникам.", reply_markup=admin_keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "kb:archive_no")
+async def kb_archive_no(callback: CallbackQuery):
+    await callback.message.answer("❌ Архивирование отменено.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "kb:search")
+async def kb_search(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id in load_admins():
+        admin_process[user_id] = "kb_search"
+    else:
+        knowledge_search_user[user_id] = True
+    await callback.message.answer(
+        "🔎 Введите ключевое слово или фразу, которую хотите найти:",
+        reply_markup=cancel_keyboard,
+    )
+    await callback.answer()
+
+
+@router.message(F.text == "🔎 Поиск обращений")
+async def appeal_search_start(message: Message):
+    if message.from_user.id not in load_admins(): return
+    admin_process[message.from_user.id]="appeal_search"
+    await message.answer("🔎 <b>ПОИСК ОБРАЩЕНИЙ</b>\n\nВведите номер обращения, имя сотрудника или слово из текста:", reply_markup=cancel_keyboard)
+
+
+@router.message(F.text == "🧰 Фильтры обращений")
+async def appeal_filters(message: Message):
+    if message.from_user.id not in load_admins(): return
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔴 Срочные", callback_data="filter:urgent"), InlineKeyboardButton(text="🟡 Важные", callback_data="filter:important")],
+        [InlineKeyboardButton(text="🟢 Обычные", callback_data="filter:normal")],
+        [InlineKeyboardButton(text="⏳ Ждут ответа", callback_data="filter:waiting_admin")],
+        [InlineKeyboardButton(text="👤 Ждут сотрудника", callback_data="filter:waiting_user")],
+        [InlineKeyboardButton(text="📂 Все открытые", callback_data="filter:open")],
+    ])
+    await message.answer("🧰 <b>ФИЛЬТРЫ ОБРАЩЕНИЙ</b>", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("filter:"))
+async def apply_filter(callback: CallbackQuery):
+    if callback.from_user.id not in load_admins(): return
+    key=callback.data.split(":",1)[1]
+    where="status!='closed'"; params=[]
+    if key in {"urgent","important","normal"}:
+        where += " AND urgency=?"; params.append({"urgent":"🔴 Срочное","important":"🟡 Важное","normal":"🟢 Обычное"}[key])
+    elif key in {"waiting_admin","waiting_user"}:
+        where += " AND status=?"; params.append(key)
+    conn=db(); rows=conn.execute(f"SELECT id,category,urgency,user_name,is_anon,created_at,status,last_activity_at FROM appeals WHERE {where} ORDER BY id DESC LIMIT 50",params).fetchall(); conn.close()
+    await send_appeal_rows(callback.message, rows, "🧰 Результат фильтра")
+    await callback.answer()
+
+
+async def send_appeal_rows(message: Message, rows, heading="📨 Обращения"):
+    if not rows:
+        await message.answer(f"{heading}\n\nНичего не найдено."); return
+    await message.answer(f"{heading}\n\nНайдено: <b>{len(rows)}</b>")
+    for aid,cat,urg,user_name,is_anon,created,status,last_activity in rows:
+        author="🕵️ Анонимно" if is_anon else f"👤 {html.escape(user_name or 'Без имени')}"
+        age=""
+        try: age_minutes=int((datetime.now(BOT_TZ)-datetime.strptime(last_activity or created,"%Y-%m-%d %H:%M:%S").replace(tzinfo=BOT_TZ)).total_seconds()//60); age=f"\n⏱ Без активности: {age_minutes} мин."
+        except Exception: pass
+        await message.answer(f"<b>№{aid}</b> {urg}\n📂 {html.escape(cat)}\n{author}\n🕒 {created}\n📌 {status}{age}",reply_markup=admin_ticket_keyboard(aid,can_reply=status!="closed"))
 
 
 # ============================================================
@@ -1371,8 +2203,206 @@ async def start_broadcast(message: Message):
     if message.from_user.id not in load_admins():
         return
     admin_process[message.from_user.id] = "broadcast"
-    await message.answer("📢 Отправьте текст, фото или видео для рассылки. Другие типы файлов запрещены.", reply_markup=cancel_keyboard)
+    await message.answer("📢 <b>МАССОВАЯ РАССЫЛКА</b>\n\nОтправьте текст, фото или видео.\n\nПосле этого бот покажет <b>предпросмотр и количество получателей</b>. Ничего не будет отправлено без вашего подтверждения.", reply_markup=cancel_keyboard)
 
+
+
+@router.callback_query(F.data == "broadcast_edit")
+async def broadcast_edit(callback: CallbackQuery):
+    if callback.from_user.id not in load_admins():
+        return
+    broadcast_draft.pop(callback.from_user.id, None)
+    admin_process[callback.from_user.id] = "broadcast"
+    await callback.message.answer(
+        "✏️ Отправьте исправленный текст, фото или видео для рассылки.",
+        reply_markup=cancel_keyboard,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "broadcast_cancel")
+async def broadcast_cancel(callback: CallbackQuery):
+    if callback.from_user.id not in load_admins():
+        return
+    broadcast_draft.pop(callback.from_user.id, None)
+    admin_process.pop(callback.from_user.id, None)
+    await callback.message.answer("❌ Рассылка отменена.", reply_markup=admin_keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "broadcast_prepare")
+async def broadcast_prepare(callback: CallbackQuery):
+    admin_id = callback.from_user.id
+    if admin_id not in load_admins():
+        return
+    draft = broadcast_draft.get(admin_id)
+    if not draft:
+        await callback.answer("Рассылка уже обработана или устарела", show_alert=True)
+        return
+    await callback.message.answer(
+        "🚨 <b>ПОСЛЕДНЕЕ ПОДТВЕРЖДЕНИЕ</b>\n\n"
+        f"👥 Получателей: <b>{draft['recipient_count']}</b>\n\n"
+        "⚠️ После подтверждения сообщение будет отправлено всем зарегистрированным участникам.",
+        reply_markup=broadcast_final_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "broadcast_send")
+async def broadcast_send(callback: CallbackQuery):
+    admin_id = callback.from_user.id
+    if admin_id not in load_admins():
+        return
+    draft = broadcast_draft.pop(admin_id, None)
+    if not draft:
+        await callback.answer("Рассылка уже обработана или устарела", show_alert=True)
+        return
+
+    conn = db()
+    users = [r[0] for r in conn.execute("SELECT user_id FROM users").fetchall()]
+    conn.close()
+
+    success = failed = 0
+    failed_reasons = {}
+    for uid in users:
+        if is_user_blocked(uid):
+            continue
+        try:
+            await send_content_to_chat(
+                uid, draft["media_type"], draft["media_id"],
+                "📢 <b>ВАЖНОЕ ОБЪЯВЛЕНИЕ</b>\n\n" + (draft["text"] or ""),
+                None,
+            )
+            success += 1
+        except Exception as exc:
+            failed += 1
+            reason = type(exc).__name__
+            failed_reasons[reason] = failed_reasons.get(reason, 0) + 1
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO broadcasts(admin_id,created_at,text,media_type,media_id,success_count,failed_count) VALUES(?,?,?,?,?,?,?)",
+        (admin_id, now_str(), draft["text"], draft["media_type"], draft["media_id"], success, failed),
+    )
+    conn.commit()
+    conn.close()
+
+    total = success + failed
+    percent = (success / total * 100) if total else 0
+    reason_text = ""
+    if failed_reasons:
+        reason_text = "\n\n🔎 <b>Причины ошибок:</b>\n" + "\n".join(
+            f"• {html.escape(k)} — {v}" for k, v in failed_reasons.items()
+        )
+    log_admin_action(admin_id, "broadcast", details=f"success={success};failed={failed}")
+    await callback.message.answer(
+        "📢 <b>РАССЫЛКА ЗАВЕРШЕНА</b>\n\n"
+        f"👥 Получателей: <b>{total}</b>\n"
+        f"✅ Доставлено: <b>{success}</b>\n"
+        f"❌ Не доставлено: <b>{failed}</b>\n"
+        f"📈 Успешность: <b>{percent:.1f}%</b>"
+        f"{reason_text}",
+        reply_markup=admin_keyboard,
+    )
+    await callback.answer("Рассылка завершена")
+
+
+@router.callback_query(F.data.startswith("confirm_reply:"))
+async def confirm_reply(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    kind = callback.data.split(":", 1)[1]
+    pending = pending_user_reply if kind == "u" else pending_admin_reply
+    draft = pending.pop(user_id, None)
+    if not draft:
+        await callback.answer("Сообщение уже обработано или устарело", show_alert=True)
+        return
+
+    appeal_id = draft["appeal_id"]
+    row = get_appeal(appeal_id)
+    if not row or row[6] == "closed":
+        await callback.message.answer("⚠️ Обращение уже закрыто.", reply_markup=employee_keyboard if kind == "u" else admin_keyboard)
+        await callback.answer()
+        return
+
+    if kind == "u":
+        if row[1] != user_id or is_user_blocked(user_id):
+            await callback.answer("Обращение недоступно", show_alert=True)
+            return
+        insert_message(appeal_id, user_id, "employee", draft["text"], draft["media_type"], draft["media_id"])
+        set_status(appeal_id, "waiting_admin")
+        await callback.message.answer(
+            "✅ <b>Сообщение отправлено поддержке.</b>\nОжидайте ответа.",
+            reply_markup=employee_ticket_keyboard(appeal_id, can_reply=False),
+        )
+        for admin_id in load_admins():
+            try:
+                await send_content_to_chat(
+                    admin_id, draft["media_type"], draft["media_id"],
+                    f"📩 <b>Новое сообщение по тикету №{appeal_id}</b>\n\n{html.escape(draft['text'] or 'Без текста')}",
+                    admin_ticket_keyboard(appeal_id, can_reply=True),
+                )
+            except Exception:
+                logging.exception("Ошибка уведомления администратора")
+    else:
+        if user_id not in load_admins():
+            await callback.answer("Нет доступа", show_alert=True)
+            return
+        insert_message(appeal_id, user_id, "admin", draft["text"], draft["media_type"], draft["media_id"])
+        set_status(appeal_id, "waiting_user")
+        target_user_id = row[1]
+        try:
+            await send_content_to_chat(
+                target_user_id, draft["media_type"], draft["media_id"],
+                f"📩 <b>Ответ поддержки по тикету №{appeal_id}</b>\n\n{html.escape(draft['text'] or 'Без текста')}",
+                employee_ticket_keyboard(appeal_id, can_reply=True),
+            )
+            await callback.message.answer(
+                f"✅ <b>Ответ по тикету №{appeal_id} доставлен.</b>\nТеперь ход диалога передан сотруднику.",
+                reply_markup=admin_keyboard,
+            )
+            release_appeal_lock(appeal_id, user_id)
+            log_admin_action(user_id, "send_reply", appeal_id)
+        except Exception:
+            await callback.message.answer(
+                "⚠️ Ответ записан в историю, но доставить его сотруднику не удалось.",
+                reply_markup=admin_keyboard,
+            )
+    await callback.answer("Отправлено")
+
+
+@router.callback_query(F.data.startswith("edit_reply:"))
+async def edit_reply(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    kind = callback.data.split(":", 1)[1]
+    pending = pending_user_reply if kind == "u" else pending_admin_reply
+    draft = pending.pop(user_id, None)
+    if not draft:
+        await callback.answer("Сообщение уже обработано или устарело", show_alert=True)
+        return
+    if kind == "u":
+        compose_user[user_id] = draft["appeal_id"]
+        await callback.message.answer("✏️ Отправьте исправленный текст, фото или видео.", reply_markup=cancel_keyboard)
+    else:
+        compose_admin[user_id] = draft["appeal_id"]
+        await callback.message.answer("✏️ Отправьте исправленный ответ, фото или видео.", reply_markup=cancel_keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("cancel_reply:"))
+async def cancel_reply(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    kind = callback.data.split(":", 1)[1]
+    pending = pending_user_reply if kind == "u" else pending_admin_reply
+    draft = pending.pop(user_id, None)
+    if kind == "a" and draft:
+        release_appeal_lock(draft["appeal_id"], user_id)
+        log_admin_action(user_id, "cancel_reply", draft["appeal_id"])
+    await callback.message.answer(
+        "❌ Отправка отменена.",
+        reply_markup=employee_keyboard if kind == "u" else admin_keyboard,
+    )
+    await callback.answer()
 
 
 @router.message()
@@ -1382,7 +2412,107 @@ async def catch_messages(message: Message):
     if is_user_blocked(user_id):
         return
 
-    # 0) Admin broadcast mode.
+    # Employee knowledge-base search is intentionally separate from admin_process.
+    # This keeps the employee flow available without granting any admin workflow.
+    if user_id not in load_admins() and knowledge_search_user.get(user_id):
+        q = (message.text or "").strip()
+        if not q:
+            await message.answer("❌ Введите непустой запрос.", reply_markup=cancel_keyboard)
+            return
+        knowledge_search_user.pop(user_id, None)
+        conn = db()
+        rows = conn.execute(
+            "SELECT title, body FROM knowledge_base WHERE active=1 ORDER BY id DESC"
+        ).fetchall()
+        conn.close()
+        needle = q.casefold()
+        matches = [row for row in rows if needle in (row[0] or "").casefold() or needle in (row[1] or "").casefold()]
+        matches = matches[:20]
+        if not matches:
+            await message.answer(
+                "🔎 <b>Ничего не найдено</b>\n\n"
+                "В утверждённой базе знаний нет подходящего материала.\n\n"
+                "Можно создать обращение в поддержку.",
+                reply_markup=employee_keyboard,
+            )
+            return
+        await message.answer(
+            f"🔎 <b>Нашёл материалов: {len(matches)}</b>\n\n"
+            "Выберите подходящий ответ из результатов ниже.",
+            reply_markup=employee_keyboard,
+        )
+        for title, body in matches:
+            await message.answer(
+                f"📚 <b>{html.escape(title)}</b>\n\n{html.escape(body)}",
+                reply_markup=employee_keyboard,
+            )
+        return
+
+    # Admin simple text workflows: announcements, knowledge base, search.
+    if user_id in load_admins() and user_id in admin_process:
+        mode = admin_process[user_id]
+        if mode == "announcement_title":
+            admin_process[user_id] = "announcement_body"
+            broadcast_draft[user_id] = {"title": message.text or "Без заголовка"}
+            await message.answer("📢 Теперь отправьте текст объявления:", reply_markup=cancel_keyboard)
+            return
+        if mode == "announcement_body":
+            draft=broadcast_draft.pop(user_id,{})
+            conn=db(); conn.execute("INSERT INTO announcements(title,body,created_at,active) VALUES(?,?,?,1)",(draft.get("title","Объявление"),message.text or "",now_str())); conn.commit(); conn.close()
+            admin_process.pop(user_id,None)
+            await message.answer("✅ Объявление опубликовано и закреплено в разделе «Важные объявления». ",reply_markup=admin_keyboard)
+            return
+        if mode == "kb_title":
+            admin_process[user_id]="kb_body"; broadcast_draft[user_id]={"title":message.text or "Материал"}
+            await message.answer("📚 Теперь отправьте текст материала:",reply_markup=cancel_keyboard); return
+        if mode == "kb_body":
+            draft=broadcast_draft.pop(user_id,{})
+            body=(message.text or "").strip()
+            if not body:
+                await message.answer("❌ Текст материала не может быть пустым."); return
+            conn=db(); conn.execute("INSERT INTO knowledge_base(title,body,created_at,active) VALUES(?,?,?,1)",(draft.get("title","Материал"),body,now_str())); conn.commit(); conn.close(); admin_process.pop(user_id,None)
+            log_admin_action(user_id, "knowledge_add", details=f"title={draft.get('title','Материал')}")
+            await message.answer("✅ <b>Материал сохранён.</b>\n\nОн уже доступен сотрудникам через поиск базы знаний.",reply_markup=admin_keyboard); return
+        if mode.startswith("kb_edit_body:"):
+            try:
+                kid=int(mode.split(":",1)[1])
+            except ValueError:
+                admin_process.pop(user_id,None); await message.answer("❌ Сессия редактирования устарела.", reply_markup=admin_keyboard); return
+            body=(message.text or "").strip()
+            if not body:
+                await message.answer("❌ Новый текст не может быть пустым."); return
+            conn=db(); row=conn.execute("SELECT title FROM knowledge_base WHERE id=? AND active=1",(kid,)).fetchone()
+            if not row:
+                conn.close(); admin_process.pop(user_id,None); await message.answer("❌ Материал не найден или уже архивирован.", reply_markup=admin_keyboard); return
+            conn.execute("UPDATE knowledge_base SET body=? WHERE id=?",(body,kid)); conn.commit(); conn.close(); admin_process.pop(user_id,None)
+            log_admin_action(user_id, "knowledge_edit", details=f"knowledge_id={kid}")
+            await message.answer(f"✅ <b>Материал обновлён.</b>\n\n«{html.escape(row[0])}»",reply_markup=admin_keyboard); return
+        if mode in {"kb_search","appeal_search"}:
+            q=(message.text or "").strip()
+            if not q:
+                await message.answer("❌ Введите непустой запрос."); return
+            admin_process.pop(user_id,None)
+            conn=db()
+            if mode == "kb_search":
+                all_rows = conn.execute(
+                    "SELECT title,body FROM knowledge_base WHERE active=1 ORDER BY id DESC"
+                ).fetchall()
+                conn.close()
+                needle = q.casefold()
+                rows = [r for r in all_rows if needle in (r[0] or "").casefold() or needle in (r[1] or "").casefold()][:20]
+                if not rows:
+                    await message.answer("🔎 Ничего не найдено в базе знаний.", reply_markup=admin_keyboard)
+                    return
+                await message.answer("🔎 <b>Результаты поиска</b>", reply_markup=admin_keyboard)
+                for title,body in rows:
+                    await message.answer(f"📚 <b>{html.escape(title)}</b>\n\n{html.escape(body)}", reply_markup=admin_keyboard)
+                return
+            like=f"%{q}%"
+            rows=conn.execute("SELECT id,category,urgency,user_name,is_anon,created_at,status,last_activity_at FROM appeals WHERE CAST(id AS TEXT)=? OR user_name LIKE ? OR category LIKE ? OR id IN (SELECT appeal_id FROM messages_log WHERE text LIKE ?) ORDER BY id DESC LIMIT 50",(q,like,like,like)).fetchall(); conn.close()
+            await send_appeal_rows(message,rows,"🔎 <b>Результат поиска</b>")
+            return
+
+    # 0) Admin broadcast mode — draft first, send only after confirmation.
     if user_id in load_admins() and admin_process.get(user_id) == "broadcast":
         content = extract_content(message)
         if content is None:
@@ -1392,23 +2522,22 @@ async def catch_messages(message: Message):
         if not text and media_type == "text":
             await message.answer("❌ Текст рассылки не может быть пустым.")
             return
-        admin_process.pop(user_id, None)
         conn = db()
-        users = [r[0] for r in conn.execute("SELECT user_id FROM users").fetchall()]
+        recipients = conn.execute("SELECT user_id FROM users").fetchall()
         conn.close()
-        success = failed = 0
-        for uid in users:
-            if is_user_blocked(uid):
-                continue
-            try:
-                await send_content_to_chat(uid, media_type, media_id, text, None)
-                success += 1
-            except Exception:
-                failed += 1
-        await message.answer(
-            f"📢 Рассылка завершена.\n✅ Успешно: {success}\n❌ Ошибок: {failed}",
-            reply_markup=admin_keyboard,
+        recipient_count = sum(1 for (uid,) in recipients if not is_user_blocked(uid))
+        broadcast_draft[user_id] = {
+            "media_type": media_type, "media_id": media_id, "text": text,
+            "recipient_count": recipient_count
+        }
+        admin_process.pop(user_id, None)
+        preview = (
+            "📢 <b>ПРЕДПРОСМОТР МАССОВОЙ РАССЫЛКИ</b>\n\n"
+            f"👥 Получателей: <b>{recipient_count}</b>\n\n"
+            f"{preview_content_text(media_type, text)}\n\n"
+            "⚠️ Сообщение будет отправлено всем зарегистрированным участникам."
         )
+        await message.answer(preview, reply_markup=broadcast_confirm_keyboard())
         return
 
     # 1) New appeal content.
@@ -1426,10 +2555,9 @@ async def catch_messages(message: Message):
         new_appeal_state[user_id]["text"] = text
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="🟢 Обычное", callback_data="urgency:normal"),
-                    InlineKeyboardButton(text="🔴 Срочное", callback_data="urgency:urgent"),
-                ],
+                [InlineKeyboardButton(text="🟢 Обычное", callback_data="urgency:normal"),
+                 InlineKeyboardButton(text="🟡 Важное", callback_data="urgency:important")],
+                [InlineKeyboardButton(text="🔴 Срочное", callback_data="urgency:urgent")],
                 [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_new")],
             ]
         )
@@ -1453,18 +2581,16 @@ async def catch_messages(message: Message):
             await message.answer("❌ Сообщение не может быть пустым.")
             compose_user[user_id] = appeal_id
             return
-        insert_message(appeal_id, user_id, "employee", text, media_type, media_id)
-        set_status(appeal_id, "waiting_admin")
-        await message.answer("✅ Сообщение отправлено поддержке. Ожидайте ответа.", reply_markup=employee_ticket_keyboard(appeal_id, can_reply=False))
-        for admin_id in load_admins():
-            try:
-                await send_content_to_chat(
-                    admin_id, media_type, media_id,
-                    f"📩 <b>Новое сообщение по тикету №{appeal_id}</b>\n\n{html.escape(text or 'Без текста')}",
-                    admin_ticket_keyboard(appeal_id, can_reply=True),
-                )
-            except Exception:
-                logging.exception("Ошибка уведомления администратора")
+        pending_user_reply[user_id] = {
+            "appeal_id": appeal_id, "media_type": media_type,
+            "media_id": media_id, "text": text
+        }
+        await message.answer(
+            f"📋 <b>ПРОВЕРЬТЕ СООБЩЕНИЕ ПЕРЕД ОТПРАВКОЙ</b>\n\n"
+            f"Обращение №{appeal_id}\n\n{preview_content_text(media_type, text)}\n\n"
+            "⚠️ Сообщение ещё НЕ отправлено.",
+            reply_markup=reply_confirm_keyboard("user"),
+        )
         return
 
     # 3) Admin is explicitly composing the next turn.
@@ -1486,21 +2612,16 @@ async def catch_messages(message: Message):
             await message.answer("❌ Ответ не может быть пустым.")
             compose_admin[user_id] = appeal_id
             return
-        insert_message(appeal_id, user_id, "admin", text, media_type, media_id)
-        set_status(appeal_id, "waiting_user")
-        target_user_id = row[1]
-        try:
-            await send_content_to_chat(
-                target_user_id, media_type, media_id,
-                f"📩 <b>Ответ поддержки по тикету №{appeal_id}</b>\n\n{html.escape(text or 'Без текста')}",
-                employee_ticket_keyboard(appeal_id, can_reply=True),
-            )
-            await message.answer(
-                f"✅ Ответ по тикету №{appeal_id} доставлен. Теперь ход диалога передан сотруднику.",
-                reply_markup=admin_keyboard,
-            )
-        except Exception:
-            await message.answer("⚠️ Не удалось доставить ответ сотруднику.", reply_markup=admin_keyboard)
+        pending_admin_reply[user_id] = {
+            "appeal_id": appeal_id, "media_type": media_type,
+            "media_id": media_id, "text": text
+        }
+        await message.answer(
+            f"📋 <b>ПРОВЕРЬТЕ ОТВЕТ ПЕРЕД ОТПРАВКОЙ</b>\n\n"
+            f"Обращение №{appeal_id}\n\n{preview_content_text(media_type, text)}\n\n"
+            "⚠️ Ответ ещё НЕ отправлен сотруднику.",
+            reply_markup=reply_confirm_keyboard("admin"),
+        )
         return
 
     # 4) Active ticket exists, but user tried to bypass the turn button.
@@ -1556,6 +2677,37 @@ async def schedule_weekly_polls():
         await asyncio.sleep(20)
 
 
+async def remind_waiting_admins():
+    while True:
+        await asyncio.sleep(300)
+        try:
+            now = datetime.now(BOT_TZ)
+            conn = db()
+            rows = conn.execute("SELECT id,user_id,category,urgency,created_at,last_activity_at,status FROM appeals WHERE status!='closed'").fetchall()
+            for appeal_id,user_id,category,urgency,created,last_activity,status in rows:
+                base = last_activity or created
+                try:
+                    age = (now - datetime.strptime(base,"%Y-%m-%d %H:%M:%S").replace(tzinfo=BOT_TZ)).total_seconds()/60
+                except Exception:
+                    continue
+                if status != "waiting_admin" or age < REMINDER_FIRST_MINUTES:
+                    continue
+                r=conn.execute("SELECT last_sent_at FROM appeal_reminders WHERE appeal_id=?",(appeal_id,)).fetchone()
+                should = not r or not r[0]
+                if r and r[0]:
+                    try: should = (now-datetime.strptime(r[0],"%Y-%m-%d %H:%M:%S").replace(tzinfo=BOT_TZ)).total_seconds()/60 >= REMINDER_REPEAT_MINUTES
+                    except Exception: should=True
+                if should:
+                    conn.execute("INSERT INTO appeal_reminders(appeal_id,last_sent_at,reminder_count) VALUES(?,?,1) ON CONFLICT(appeal_id) DO UPDATE SET last_sent_at=excluded.last_sent_at,reminder_count=appeal_reminders.reminder_count+1",(appeal_id,now_str()))
+                    for admin_id in load_admins():
+                        try:
+                            await bot.send_message(admin_id,f"⏱ <b>Напоминание об обращении №{appeal_id}</b>\n\n{urgency} {html.escape(category)}\nОжидает ответа уже <b>{int(age)} мин.</b>",reply_markup=admin_ticket_keyboard(appeal_id,can_reply=True))
+                        except Exception: pass
+            conn.commit(); conn.close()
+        except Exception:
+            logging.exception("Ошибка напоминаний")
+
+
 async def auto_close_inactive_tickets():
     while True:
         await asyncio.sleep(3600)
@@ -1592,13 +2744,34 @@ async def auto_close_inactive_tickets():
             logging.exception("Ошибка автозакрытия")
 
 
+def backup_database() -> None:
+    try:
+        safe_backup_database()
+    except Exception:
+        logging.exception("Не удалось создать резервную копию базы")
+
+
+async def periodic_backup():
+    while True:
+        await asyncio.sleep(21600)
+        backup_database()
+        if not verify_database():
+            logging.error("ВНИМАНИЕ: integrity_check базы данных не прошёл!")
+
+
 # ============================================================
 # MAIN
 # ============================================================
 async def main():
     dp.include_router(router)
+    init_db()
+    if not verify_database():
+        raise RuntimeError("❌ Проверка целостности базы данных не пройдена")
     asyncio.create_task(auto_close_inactive_tickets())
     asyncio.create_task(schedule_weekly_polls())
+    asyncio.create_task(periodic_backup())
+    asyncio.create_task(remind_waiting_admins())
+    backup_database()
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
